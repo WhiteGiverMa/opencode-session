@@ -10,6 +10,7 @@ import {
 export type SessionInfo = NonNullable<ReturnType<Plugin.Context["data"]["session"]["get"]>>
 export type SessionMessage = ReturnType<Plugin.Context["data"]["session"]["message"]["list"]>[number]
 export type SessionRoute = Extract<ReturnType<Plugin.Context["ui"]["router"]["current"]>, { type: "session" }>
+export type HostEvent = Parameters<Parameters<Plugin.Context["data"]["listen"]>[0]>[0]["details"]
 
 export interface ComposerRequest {
   rootSessionID: string
@@ -181,6 +182,116 @@ export function resolveSelectedID(
   return visibleHubItems(items)[0]?.sessionID
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive tab strip layout (mirrors OpenCode v2 `adaptiveSessionTabLayout`)
+// ---------------------------------------------------------------------------
+
+export const ASIDE_TAB_WIDTH = 20
+export const ASIDE_TAB_MAX_WIDTH = 30
+export const ASIDE_TAB_MIN_WIDTH = 9
+export const asideOverflowMarkerWidth = (count: number): number => String(count).length + 2
+
+export interface AdaptiveAsideTabLayout<T extends { readonly sessionID: string }> {
+  readonly tabs: readonly T[]
+  readonly widths: readonly number[]
+  readonly before: number
+  readonly after: number
+  readonly start: number
+  readonly total: number
+}
+
+export function adaptiveAsideTabLayout<T extends { readonly sessionID: string }>(
+  tabs: readonly T[],
+  activeID: string | undefined,
+  available: number,
+  previousStart = 0,
+): AdaptiveAsideTabLayout<T> {
+  if (tabs.length === 0 || available <= 0) {
+    return { tabs: [], widths: [], before: 0, after: 0, start: 0, total: 0 }
+  }
+
+  const activeIndex = tabs.findIndex((tab) => tab.sessionID === activeID)
+  const fit = (width: number) =>
+    Math.min(
+      tabs.length,
+      Math.max(
+        1,
+        activeIndex === -1
+          ? Math.floor(Math.max(0, width) / ASIDE_TAB_MIN_WIDTH)
+          : 1 + Math.floor((Math.max(0, width) - ASIDE_TAB_WIDTH) / ASIDE_TAB_MIN_WIDTH),
+      ),
+    )
+
+  const solve = (count: number, start: number, attempts: number): { count: number; start: number } => {
+    const boundedStart = Math.min(Math.max(0, start), tabs.length - count)
+    const nextStart = Math.min(
+      Math.max(
+        0,
+        activeIndex === -1
+          ? boundedStart
+          : activeIndex < boundedStart
+            ? activeIndex
+            : activeIndex >= boundedStart + count
+              ? activeIndex - count + 1
+              : boundedStart,
+      ),
+      tabs.length - count,
+    )
+    const markers =
+      (nextStart > 0 ? asideOverflowMarkerWidth(nextStart) : 0) +
+      (nextStart + count < tabs.length ? asideOverflowMarkerWidth(tabs.length - nextStart - count) : 0)
+    const nextCount = fit(available - markers)
+    if (nextCount === count || attempts === 0) return { count, start: nextStart }
+    return solve(nextCount, nextStart, attempts - 1)
+  }
+
+  const solved = solve(fit(available), previousStart, 3)
+  const visible = tabs.slice(solved.start, solved.start + solved.count)
+  const before = solved.start
+  const after = tabs.length - solved.start - solved.count
+  const contentWidth = Math.max(
+    1,
+    available -
+      (before > 0 ? asideOverflowMarkerWidth(before) : 0) -
+      (after > 0 ? asideOverflowMarkerWidth(after) : 0),
+  )
+  const roomy = contentWidth >= ASIDE_TAB_WIDTH * visible.length
+  const total = roomy ? Math.min(contentWidth, ASIDE_TAB_MAX_WIDTH * visible.length) : contentWidth
+  if (roomy || activeIndex === -1) {
+    const width = Math.floor(total / visible.length)
+    const remainder = total - width * visible.length
+    return {
+      tabs: visible,
+      widths: visible.map((_, index) => width + Number(index < remainder)),
+      before,
+      after,
+      start: solved.start,
+      total,
+    }
+  }
+
+  const inactiveWidth =
+    visible.length === 1
+      ? 0
+      : Math.min(
+          ASIDE_TAB_WIDTH,
+          Math.max(
+            ASIDE_TAB_MIN_WIDTH,
+            Math.floor((total - Math.min(ASIDE_TAB_WIDTH, total)) / (visible.length - 1)),
+          ),
+        )
+  const activeWidth = visible.length === 1 ? total : total - inactiveWidth * (visible.length - 1)
+
+  return {
+    tabs: visible,
+    widths: visible.map((tab) => (tab.sessionID === activeID ? activeWidth : inactiveWidth)),
+    before,
+    after,
+    start: solved.start,
+    total,
+  }
+}
+
 export function readDraft(drafts: Readonly<Record<string, string>>, key: string): string {
   return drafts[key] ?? ""
 }
@@ -230,6 +341,12 @@ export function shouldFollowStreaming(awayFromBottom: boolean): boolean {
   return !awayFromBottom
 }
 
+const ANSI_ESCAPE_RE = /\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))/g
+
+export function stripAnsiCodes(value: string): string {
+  return value.replace(ANSI_ESCAPE_RE, "")
+}
+
 function singleLine(value: string): string {
   return value.replace(/\s+/g, " ").trim()
 }
@@ -261,6 +378,55 @@ export function compactToolInput(input: unknown): string {
   }
 }
 
+export interface CollapsedShellPreview {
+  readonly commandLine: string
+  readonly previewOutput: string
+  readonly overflow: boolean
+  readonly hiddenLines: number
+}
+
+export function collapseShellPreview(
+  command: string,
+  output: string,
+  maxOutputLines = 8,
+  maxCommandChars = 160,
+): CollapsedShellPreview {
+  const cleanCmd = stripAnsiCodes(command).trim()
+  const cmdOverflow = cleanCmd.length > maxCommandChars || cleanCmd.includes("\n")
+  const commandLine = cmdOverflow
+    ? `${cleanCmd.split("\n", 1)[0]?.slice(0, maxCommandChars) ?? ""}…`
+    : cleanCmd
+
+  const cleanOut = stripAnsiCodes(output).trim()
+  if (!cleanOut) {
+    return {
+      commandLine,
+      previewOutput: "",
+      overflow: cmdOverflow,
+      hiddenLines: 0,
+    }
+  }
+
+  const lines = cleanOut.split("\n")
+  if (lines.length <= maxOutputLines && cleanOut.length <= maxOutputLines * 140) {
+    return {
+      commandLine,
+      previewOutput: cleanOut,
+      overflow: cmdOverflow,
+      hiddenLines: 0,
+    }
+  }
+
+  const kept = lines.slice(0, maxOutputLines).join("\n")
+  const capped = kept.length > maxOutputLines * 140 ? `${kept.slice(0, maxOutputLines * 140)}…` : kept
+  return {
+    commandLine,
+    previewOutput: capped,
+    overflow: true,
+    hiddenLines: Math.max(1, lines.length - maxOutputLines),
+  }
+}
+
 interface MessageRowBase {
   readonly id: string
   readonly messageID: string
@@ -270,6 +436,7 @@ export type MessageRow =
   | (MessageRowBase & {
       readonly kind: "user" | "synthetic" | "system"
       readonly text: string
+      readonly description?: string
     })
   | (MessageRowBase & {
       readonly kind: "assistant"
@@ -280,6 +447,7 @@ export type MessageRow =
       readonly kind: "reasoning"
       readonly text: string
       readonly preview: string
+      readonly done: boolean
       readonly elapsedMs?: number
     })
   | (MessageRowBase & {
@@ -288,10 +456,18 @@ export type MessageRow =
       readonly toolName: string
       readonly status: "streaming" | "running" | "completed" | "error"
       readonly error?: string
+      readonly isShell?: boolean
+      readonly command?: string
+      readonly workdir?: string
+      readonly output?: string
+      readonly detail?: string
     })
   | (MessageRowBase & {
       readonly kind: "copy"
       readonly text: string
+      readonly agent?: string
+      readonly model?: { readonly providerID: string; readonly id: string; readonly variant?: string }
+      readonly durationMs?: number
     })
 
 type AssistantMessage = Extract<SessionMessage, { type: "assistant" }>
@@ -305,19 +481,89 @@ function durationLabel(part: ToolPart): string {
   return ` (${((completed - started) / 1000).toFixed(1)}s)`
 }
 
+function extractToolTextOutput(part: ToolPart): string {
+  const state = part.state
+  if (state.status !== "completed" && state.status !== "error") return ""
+  if (!("content" in state) || !Array.isArray(state.content)) return ""
+  const texts: string[] = []
+  for (const item of state.content) {
+    if (isRecord(item) && item.type === "text" && typeof item.text === "string" && item.text.trim()) {
+      texts.push(stripAnsiCodes(item.text))
+    }
+  }
+  return texts.join("\n").trim()
+}
+
+function parseInputRecord(raw: unknown): Record<string, unknown> | undefined {
+  if (isRecord(raw)) return raw
+  if (typeof raw === "string") {
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      return isRecord(parsed) ? parsed : undefined
+    } catch {
+      return undefined
+    }
+  }
+  return undefined
+}
+
 export function formatToolRow(part: ToolPart): Omit<Extract<MessageRow, { kind: "tool" }>, "id" | "messageID" | "kind"> {
   const status = part.state.status
   const marker = status === "completed" ? "✓" : status === "error" ? "✗" : "⟳"
-  const input = compactToolInput(part.state.input)
-  const base = `${marker} ${part.name}${input ? ` · ${input}` : ""}${durationLabel(part)}`
-  if (status !== "error") return { text: base, toolName: part.name, status }
+  const inputSummary = compactToolInput(part.state.input)
+  const base = `${marker} ${part.name}${inputSummary ? ` · ${inputSummary}` : ""}${durationLabel(part)}`
+  const canonical = part.name.toLowerCase()
+  const isShell = canonical === "shell" || canonical === "bash"
+  const inputRecord = parseInputRecord(part.state.input)
+  const command = isShell && typeof inputRecord?.command === "string" ? inputRecord.command : undefined
+  const workdir = isShell && typeof inputRecord?.workdir === "string" ? inputRecord.workdir : undefined
+  const output = extractToolTextOutput(part)
+
+  let detail: string | undefined
+  if (!isShell) {
+    const sections: string[] = []
+    if (inputRecord && Object.keys(inputRecord).length > 0) {
+      try {
+        sections.push(JSON.stringify(inputRecord, null, 2))
+      } catch {
+        // Ignore unserializable input
+      }
+    }
+    if (output) {
+      sections.push(output.length > 2400 ? `${output.slice(0, 2400)}\n…` : output)
+    }
+    if (sections.length > 0) detail = sections.join("\n\n")
+  }
+
+  const extra = {
+    ...(isShell ? { isShell: true } : {}),
+    ...(command !== undefined ? { command } : {}),
+    ...(workdir !== undefined ? { workdir } : {}),
+    ...(output ? { output } : {}),
+    ...(detail ? { detail } : {}),
+  }
+
+  if (status !== "error") {
+    return { text: base, toolName: part.name, status, ...extra }
+  }
   const error = part.state.error.message
   return {
     text: `${base}${error ? ` · ${clipped(error, 160)}` : ""}`,
     toolName: part.name,
     status,
     error,
+    ...extra,
   }
+}
+
+export function formatDurationCompact(ms: number | undefined): string {
+  if (ms === undefined || !(ms >= 0)) return ""
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  const sec = ms / 1000
+  if (sec < 60) return `${sec.toFixed(1)}s`
+  const mins = Math.floor(sec / 60)
+  const rem = Math.round(sec % 60)
+  return `${mins}m ${rem}s`
 }
 
 /** Flatten the host's message union into renderer-agnostic transcript rows. */
@@ -326,11 +572,39 @@ export function formatMessageRows(messages: readonly SessionMessage[]): readonly
   for (const message of messages) {
     if (message.type === "user" || message.type === "synthetic" || message.type === "system") {
       if (!message.text) continue
+      const description =
+        "description" in message && typeof message.description === "string" ? message.description : undefined
+      // Mirror OpenCode native `rows.ts:392`: internal synthetics without a description (e.g. `<fork-notice>`) stay hidden.
+      if (message.type === "synthetic" && !description?.trim()) continue
       rows.push({
         id: message.id,
         messageID: message.id,
         kind: message.type,
         text: message.text,
+        ...(description ? { description } : {}),
+      })
+      continue
+    }
+    if (message.type === "shell") {
+      const cmd = message.command ?? ""
+      const out = message.output?.output ? stripAnsiCodes(message.output.output).trim() : ""
+      const status =
+        message.status === "running"
+          ? ("running" as const)
+          : message.exit !== undefined && message.exit !== 0
+            ? ("error" as const)
+            : ("completed" as const)
+      rows.push({
+        id: message.id,
+        messageID: message.id,
+        kind: "tool",
+        toolName: "shell",
+        status,
+        isShell: true,
+        command: cmd,
+        ...(out ? { output: out } : {}),
+        text: `${status === "completed" ? "✓" : status === "error" ? "✗" : "⟳"} shell · ${clipped(cmd)}`,
+        ...(status === "error" && message.exit !== undefined ? { error: `exit code ${message.exit}` } : {}),
       })
       continue
     }
@@ -354,17 +628,20 @@ export function formatMessageRows(messages: readonly SessionMessage[]): readonly
         return
       }
       if (part.type === "reasoning") {
-        if (!part.text) return
-        const elapsedMs =
-          part.time?.completed !== undefined && part.time.created !== undefined
-            ? Math.max(0, part.time.completed - part.time.created)
-            : undefined
+        const cleaned = part.text.replace("[REDACTED]", "").trim()
+        if (!cleaned) return
+        const done = part.time?.completed !== undefined || message.time.completed !== undefined
+        const end = part.time?.completed ?? message.time.completed
+        const start = part.time?.created ?? message.time.created
+        const elapsedMs = end !== undefined && start !== undefined ? Math.max(0, end - start) : undefined
+        const previewLine = cleaned.split("\n").findLast((line) => line.trim()) ?? "Thinking…"
         rows.push({
           id,
           messageID: message.id,
           kind: "reasoning",
-          text: part.text,
-          preview: clipped(part.text.split("\n").findLast((line) => line.trim()) ?? "思考中…", 72),
+          text: cleaned,
+          preview: clipped(previewLine.replace(/^#+\s*/, ""), 64),
+          done,
           ...(elapsedMs === undefined ? {} : { elapsedMs }),
         })
         return
@@ -372,8 +649,20 @@ export function formatMessageRows(messages: readonly SessionMessage[]): readonly
       rows.push({ id, messageID: message.id, kind: "tool", ...formatToolRow(part) })
     })
     const copied = copyText.join("\n\n")
-    if (copied) {
-      rows.push({ id: `${message.id}:copy`, messageID: message.id, kind: "copy", text: copied })
+    const durationMs =
+      message.time.completed !== undefined && message.time.created !== undefined
+        ? Math.max(0, message.time.completed - message.time.created)
+        : undefined
+    if (copied || message.time.completed !== undefined) {
+      rows.push({
+        id: `${message.id}:copy`,
+        messageID: message.id,
+        kind: "copy",
+        text: copied,
+        agent: message.agent,
+        model: message.model,
+        ...(durationMs !== undefined ? { durationMs } : {}),
+      })
     }
     if (message.error) {
       rows.push({
@@ -474,4 +763,134 @@ export function resolveModelDisplay(
 
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Applies live SSE deltas onto the panel-owned message mirror so forked `/btw`
+ * sessions (`parentID === null`) stream smoothly even when OpenCode v2.3.0's
+ * `createSessionRetention` evicts non-tab root sessions from `data.session.message`.
+ */
+export function applyPanelStreamEvent(
+  current: readonly SessionMessage[],
+  event: HostEvent,
+  targetSessionID: string,
+): { readonly next: readonly SessionMessage[]; readonly shouldRefetch: boolean } {
+  if (!("sessionID" in event.data) || event.data.sessionID !== targetSessionID) {
+    return { next: current, shouldRefetch: false }
+  }
+
+  switch (event.type) {
+    case "session.inbox.enqueued": {
+      if (event.data.item.type === "user") {
+        const id = event.data.inboxID
+        if (current.some((m) => m.id === id)) return { next: current, shouldRefetch: false }
+        return {
+          next: [
+            ...current,
+            {
+              id,
+              type: "user",
+              text: event.data.item.payload.text,
+              files: event.data.item.payload.files,
+              time: { created: event.created },
+            },
+          ],
+          shouldRefetch: false,
+        }
+      }
+      return { next: current, shouldRefetch: true }
+    }
+    case "session.step.started": {
+      const msgID = event.data.assistantMessageID
+      if (current.some((m) => m.id === msgID)) return { next: current, shouldRefetch: false }
+      return {
+        next: [
+          ...current,
+          {
+            id: msgID,
+            type: "assistant",
+            agent: event.data.agent,
+            model: event.data.model,
+            content: [],
+            time: { created: event.data.started },
+          },
+        ],
+        shouldRefetch: false,
+      }
+    }
+    case "session.text.started": {
+      const msgID = event.data.assistantMessageID
+      return {
+        next: current.map((m) =>
+          m.id === msgID && m.type === "assistant"
+            ? { ...m, content: [...m.content, { type: "text" as const, text: "" }] }
+            : m,
+        ),
+        shouldRefetch: false,
+      }
+    }
+    case "session.text.delta": {
+      const msgID = event.data.assistantMessageID
+      return {
+        next: current.map((m) => {
+          if (m.id !== msgID || m.type !== "assistant") return m
+          const copy = [...m.content]
+          const lastIdx = copy.findLastIndex((p) => p.type === "text")
+          if (lastIdx === -1) {
+            copy.push({ type: "text", text: event.data.delta })
+          } else {
+            const prev = copy[lastIdx]
+            if (prev && prev.type === "text") {
+              copy[lastIdx] = { ...prev, text: prev.text + event.data.delta }
+            }
+          }
+          return { ...m, content: copy }
+        }),
+        shouldRefetch: false,
+      }
+    }
+    case "session.reasoning.started": {
+      const msgID = event.data.assistantMessageID
+      return {
+        next: current.map((m) =>
+          m.id === msgID && m.type === "assistant"
+            ? {
+                ...m,
+                content: [...m.content, { type: "reasoning" as const, text: "", time: { created: event.created } }],
+              }
+            : m,
+        ),
+        shouldRefetch: false,
+      }
+    }
+    case "session.reasoning.delta": {
+      const msgID = event.data.assistantMessageID
+      return {
+        next: current.map((m) => {
+          if (m.id !== msgID || m.type !== "assistant") return m
+          const copy = [...m.content]
+          const lastIdx = copy.findLastIndex((p) => p.type === "reasoning")
+          if (lastIdx === -1) {
+            copy.push({ type: "reasoning", text: event.data.delta, time: { created: event.created } })
+          } else {
+            const prev = copy[lastIdx]
+            if (prev && prev.type === "reasoning") {
+              copy[lastIdx] = { ...prev, text: prev.text + event.data.delta }
+            }
+          }
+          return { ...m, content: copy }
+        }),
+        shouldRefetch: false,
+      }
+    }
+    case "session.tool.called":
+    case "session.tool.success":
+    case "session.tool.failed":
+    case "session.step.ended":
+    case "session.idle":
+    case "session.synthetic":
+      return { next: current, shouldRefetch: true }
+    default:
+      return { next: current, shouldRefetch: false }
+  }
 }

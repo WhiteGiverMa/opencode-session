@@ -4,6 +4,7 @@ import path from "node:path"
 import type { Plugin } from "@opencode/plugin/tui"
 import { generateSyntax } from "@opencode/theme/tui"
 import {
+  BoxRenderable,
   MacOSScrollAccel,
   MouseButton,
   RenderableEvents,
@@ -16,9 +17,9 @@ import {
   type SyntaxStyle,
   type TextareaRenderable,
 } from "@opentui/core"
-import { createEffect, createMemo, createSignal, onCleanup, Show, type JSX } from "solid-js"
-
-type Theme = Plugin.Context["theme"]
+import { Portal, useTerminalDimensions } from "@opentui/solid"
+import { createEffect, createMemo, createSignal, For, onCleanup, Show, type JSX } from "solid-js"
+import stringWidth from "string-width"
 
 export const EmptyBorder = {
   topLeft: "",
@@ -43,13 +44,14 @@ export const SplitBorder = {
 } as const
 
 // ---------------------------------------------------------------------------
-// Native CLI scroll acceleration & speed reader (matches OpenCode TUI exactly)
+// Native CLI scroll acceleration, speed & experiment reader
 // ---------------------------------------------------------------------------
 
 export interface HostCliScrollConfig {
   readonly acceleration: boolean
   readonly speed: number
   readonly scrollbar: boolean
+  readonly newDesigns: boolean
 }
 
 class CustomSpeedScroll implements ScrollAcceleration {
@@ -111,6 +113,7 @@ export function readHostCliScrollConfig(): HostCliScrollConfig {
   let acceleration = false
   let speed = 3
   let scrollbar = false
+  let newDesigns = false
 
   const applyFrom = (record: Record<string, unknown> | null) => {
     if (!record) return
@@ -124,6 +127,11 @@ export function readHostCliScrollConfig(): HostCliScrollConfig {
     if (typeof session === "object" && session !== null && !Array.isArray(session)) {
       const sess = session as Record<string, unknown>
       if (typeof sess.scrollbar === "boolean") scrollbar = sess.scrollbar
+    }
+    const experimental = record.experimental
+    if (typeof experimental === "object" && experimental !== null && !Array.isArray(experimental)) {
+      const exp = experimental as Record<string, unknown>
+      if (typeof exp["new-designs"] === "boolean") newDesigns = exp["new-designs"]
     }
   }
 
@@ -146,7 +154,7 @@ export function readHostCliScrollConfig(): HostCliScrollConfig {
     applyFrom(parseRecord(inline))
   }
 
-  return { acceleration, speed, scrollbar }
+  return { acceleration, speed, scrollbar, newDesigns }
 }
 
 export function createHostScrollAcceleration(config = readHostCliScrollConfig()): ScrollAcceleration {
@@ -157,7 +165,7 @@ export function createHostScrollAcceleration(config = readHostCliScrollConfig())
 }
 
 // ---------------------------------------------------------------------------
-// Theme helpers, agent colors, and Markdown SyntaxStyle lifecycle
+// Theme helpers, exact OpenCode agent color matching, and SyntaxStyle
 // ---------------------------------------------------------------------------
 
 export function useHostSyntaxStyle(context: Plugin.Context): () => SyntaxStyle {
@@ -187,21 +195,53 @@ export function useHostSyntaxStyle(context: Plugin.Context): () => SyntaxStyle {
   })
 }
 
-export function resolveAgentAccent(theme: Theme, agentID: string | null | undefined): RGBA {
-  const palette = theme.categorical
-  if (!palette || palette.length === 0) return theme.hue.accent[500]
-  if (!agentID) return palette[0]?.[400] ?? theme.hue.accent[500]
-  const normalized = agentID.toLowerCase()
-  if (normalized === "meidocho" || normalized === "build") return palette[0]?.[400] ?? theme.hue.accent[500]
-  if (normalized === "general") return theme.text.feedback.warning.base
-  if (normalized === "explore") return theme.text.feedback.info.base
-  if (normalized === "oracle") return (palette[2] ?? palette[0])?.[400] ?? theme.hue.accent[500]
-  let hash = 0
-  for (let i = 0; i < normalized.length; i += 1) {
-    hash = (hash * 31 + normalized.charCodeAt(i)) >>> 0
+/**
+ * Exact replica of `packages/tui/src/context/local.tsx:createAgent().color(id)`:
+ * 1. Honors explicit `agent.color` hex from `opencode.json(c)` (e.g. `meidocho`).
+ * 2. Otherwise indexes into `visibleAgents` (`!agent.hidden`) against deduplicated
+ *    `theme.categorical[i][newDesigns ? 400 : 200]`.
+ */
+export function resolveHostAgentAccent(
+  context: Plugin.Context,
+  agentID: string | null | undefined,
+  newDesigns = false,
+): RGBA {
+  const theme = context.theme
+  const step = newDesigns ? 400 : 200
+  const colors: RGBA[] = []
+  for (const scale of theme.categorical) {
+    const candidate = scale[step]
+    if (candidate && !colors.some((existing) => existing.equals(candidate))) {
+      colors.push(candidate)
+    }
   }
-  const scale = palette[hash % palette.length]
-  return scale?.[400] ?? theme.hue.accent[500]
+  const fallback = colors[0] ?? theme.hue.accent[step]
+  if (!agentID) return fallback
+
+  const allAgents = context.data.location.agent.list(context.location) ?? []
+  const visibleAgents = allAgents.filter((agent) => !agent.hidden)
+  const index = visibleAgents.findIndex((agent) => agent.id === agentID)
+  if (index === -1) {
+    const hiddenMatch = allAgents.find((agent) => agent.id === agentID)
+    if (hiddenMatch?.color) {
+      try {
+        return RGBA.fromHex(hiddenMatch.color)
+      } catch {
+        return fallback
+      }
+    }
+    return fallback
+  }
+
+  const matched = visibleAgents[index]
+  if (matched?.color) {
+    try {
+      return RGBA.fromHex(matched.color)
+    } catch {
+      return fallback
+    }
+  }
+  return colors.length > 0 ? (colors[index % colors.length] ?? fallback) : fallback
 }
 
 export function titlecaseAgent(agentID: string | null | undefined): string {
@@ -219,7 +259,7 @@ export function setPointer(context: Plugin.Context, style: MousePointerStyle): v
 }
 
 // ---------------------------------------------------------------------------
-// GuiButton: GUI-like highlighted box button (no ASCII `[x]` brackets)
+// GuiButton: GUI-like highlighted box button
 // ---------------------------------------------------------------------------
 
 export type GuiButtonVariant = "primary" | "secondary" | "ghost" | "success" | "warning" | "danger"
@@ -235,8 +275,8 @@ export interface GuiButtonProps {
   readonly bold?: boolean
   readonly paddingX?: number
   readonly idleTextColor?: RGBA
-  /** Optional pre-focus hook so split-pane clicks claim right-pane focus before stopping propagation. */
   readonly onActivateHost?: () => void
+  readonly onRightClick?: (event: MouseEvent) => void
   readonly onClick: (shift: boolean) => void
 }
 
@@ -302,7 +342,6 @@ export function GuiButton(props: GuiButtonProps) {
       }
     }
 
-    // Default "secondary": subtle raised surface at rest (600), brightens on hover (500)
     return {
       bg: isPressed
         ? theme.increase(theme.background.raised.max, 1)
@@ -336,6 +375,12 @@ export function GuiButton(props: GuiButtonProps) {
         setPointer(props.context, "default")
       }}
       onMouseDown={(event: MouseEvent) => {
+        if (event.button === MouseButton.RIGHT && props.onRightClick) {
+          event.preventDefault()
+          event.stopPropagation()
+          props.onRightClick(event)
+          return
+        }
         if (event.button !== MouseButton.LEFT || props.disabled) return
         props.onActivateHost?.()
         event.stopPropagation()
@@ -366,7 +411,128 @@ export function GuiButton(props: GuiButtonProps) {
 }
 
 // ---------------------------------------------------------------------------
-// GraphicalPromptCard: Exact replica of OpenCode's graphical <Prompt> card
+// PopupContextMenu: Native OpenCode v2 right-click Portal menu
+// ---------------------------------------------------------------------------
+
+export interface PopupMenuItem {
+  readonly title: string
+  readonly run?: () => void
+}
+
+export function PopupContextMenu(props: {
+  readonly context: Plugin.Context
+  readonly x: number
+  readonly y: number
+  readonly items: readonly PopupMenuItem[]
+  readonly onClose: () => void
+}) {
+  const dimensions = useTerminalDimensions()
+  const theme = props.context.theme
+  const [hoveredIdx, setHoveredIdx] = createSignal<number>()
+
+  onCleanup(props.context.keymap.mode.push("menu"))
+  props.context.keymap.layer(() => ({
+    mode: "menu",
+    commands: [{ bind: "escape,ctrl+c", title: "Close menu", group: "Session", run: props.onClose }],
+  }))
+
+  onCleanup(() => {
+    setPointer(props.context, "default")
+  })
+
+  const menuWidth = createMemo(() =>
+    Math.min(
+      dimensions().width,
+      Math.max(20, ...props.items.map((item) => Math.min(48, stringWidth(item.title) + 3))),
+    ),
+  )
+  const menuHeight = createMemo(() => Math.min(props.items.length, Math.max(1, dimensions().height - 2)))
+  const top = createMemo(() => Math.max(0, Math.min(props.y + 1, dimensions().height - menuHeight())))
+  const left = createMemo(() => Math.max(0, Math.min(props.x, dimensions().width - menuWidth())))
+
+  const trigger = (idx: number) => {
+    const item = props.items[idx]
+    if (!item?.run) return
+    props.onClose()
+    item.run()
+  }
+
+  return (
+    <Portal
+      ref={(container) => {
+        if (!(container instanceof BoxRenderable)) return
+        container.position = "absolute"
+        container.left = 0
+        container.top = 0
+        container.zIndex = 2500
+      }}
+    >
+      <box
+        position="absolute"
+        left={0}
+        top={0}
+        width={dimensions().width}
+        height={dimensions().height}
+        zIndex={2500}
+        onMouseDown={(event: MouseEvent) => {
+          props.onClose()
+          event.preventDefault()
+          event.stopPropagation()
+        }}
+      >
+        <scrollbox
+          position="absolute"
+          left={left()}
+          top={top()}
+          width={menuWidth()}
+          height={menuHeight()}
+          scrollX={false}
+          scrollbarOptions={{ visible: false }}
+          backgroundColor={theme.background.raised.base}
+          onMouseDown={(event: MouseEvent) => {
+            if (event.button === MouseButton.RIGHT) props.onClose()
+            event.preventDefault()
+            event.stopPropagation()
+          }}
+        >
+          <For each={props.items}>
+            {(item, idx) => (
+              <box
+                width="100%"
+                height={1}
+                flexShrink={0}
+                paddingLeft={1}
+                paddingRight={1}
+                backgroundColor={item.run && hoveredIdx() === idx() ? theme.background.raised.high : undefined}
+                onMouseOver={() => {
+                  setHoveredIdx(item.run ? idx() : undefined)
+                  setPointer(props.context, item.run ? "pointer" : "default")
+                }}
+                onMouseOut={() => {
+                  setHoveredIdx(undefined)
+                  setPointer(props.context, "default")
+                }}
+                onMouseUp={(event: MouseEvent) => {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  if (event.button === MouseButton.RIGHT) return
+                  trigger(idx())
+                }}
+              >
+                <text fg={item.run ? theme.text.base : theme.text.muted} wrapMode="none" truncate selectable={false}>
+                  {item.title}
+                </text>
+              </box>
+            )}
+          </For>
+        </scrollbox>
+      </box>
+    </Portal>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// GraphicalPromptCard: Clean OpenCode-native <Prompt> card (zero redundant hints)
 // ---------------------------------------------------------------------------
 
 export interface GraphicalPromptCardProps {
@@ -384,7 +550,6 @@ export interface GraphicalPromptCardProps {
   readonly running?: boolean
   readonly minHeight?: number
   readonly maxHeight?: number
-  readonly footerHint?: string
   readonly actions?: JSX.Element
   readonly topSlot?: JSX.Element
   readonly onActivateHost?: () => void
@@ -435,7 +600,6 @@ export function GraphicalPromptCard(props: GraphicalPromptCardProps) {
 
   return (
     <box width="100%" flexDirection="column" flexShrink={0}>
-      {/* Main graphical prompt card with left accent bar */}
       <box
         width="100%"
         border={["left"]}
@@ -494,7 +658,7 @@ export function GraphicalPromptCard(props: GraphicalPromptCardProps) {
               }
             }}
             width="100%"
-            minHeight={props.minHeight ?? 2}
+            minHeight={props.minHeight ?? 1}
             maxHeight={props.maxHeight ?? 6}
             wrapMode="word"
             placeholder={props.placeholder}
@@ -541,7 +705,6 @@ export function GraphicalPromptCard(props: GraphicalPromptCardProps) {
             }}
           />
 
-          {/* Metadata & inline GUI action bar matching OpenCode native PromptMetadataRow */}
           <box
             flexDirection="row"
             flexShrink={0}
@@ -551,7 +714,7 @@ export function GraphicalPromptCard(props: GraphicalPromptCardProps) {
             alignItems="center"
           >
             <box flexDirection="row" gap={1} flexGrow={1} flexShrink={1} minWidth={0}>
-              <text fg={props.agentAccent} attributes={TextAttributes.BOLD} wrapMode="none" flexShrink={0} selectable={false}>
+              <text fg={props.agentAccent} wrapMode="none" flexShrink={0} selectable={false}>
                 {props.agentLabel}
               </text>
               <Show when={props.modelLabel}>
@@ -622,7 +785,6 @@ export function GraphicalPromptCard(props: GraphicalPromptCardProps) {
         </box>
       </box>
 
-      {/* Signature half-block bottom edge (`╹▀▀▀▀▀▀▀▀`) exactly matching OpenCode native Prompt */}
       <box
         height={1}
         width="100%"
@@ -651,16 +813,6 @@ export function GraphicalPromptCard(props: GraphicalPromptCardProps) {
           }
         />
       </box>
-
-      <Show when={props.footerHint}>
-        {(hint) => (
-          <box height={1} paddingLeft={2} paddingRight={1} flexShrink={0}>
-            <text fg={theme.text.muted} wrapMode="none" truncate selectable={false}>
-              {hint()}
-            </text>
-          </box>
-        )}
-      </Show>
     </box>
   )
 }

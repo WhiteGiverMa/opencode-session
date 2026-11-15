@@ -1,6 +1,7 @@
 import type { Plugin } from "@opencode/plugin/tui"
 import {
   MouseButton,
+  RGBA,
   TabSelectRenderableEvents,
   TextAttributes,
   type KeyEvent,
@@ -24,8 +25,12 @@ import {
   sendSessionPrompt,
 } from "./commands.ts"
 import {
+  adaptiveAsideTabLayout,
+  applyPanelStreamEvent,
   availableSubagents,
+  collapseShellPreview,
   errorMessage,
+  formatDurationCompact,
   formatMessageRows,
   hiddenHubItems,
   isAwayFromBottom,
@@ -40,6 +45,7 @@ import {
   visibleHubItems,
   writeDraft,
   type MessageRow,
+  type SessionMessage,
   type TuiMemoryState,
   type UpdateTuiMemory,
 } from "./state.ts"
@@ -48,9 +54,12 @@ import {
   EmptyBorder,
   GraphicalPromptCard,
   GuiButton,
+  PopupContextMenu,
+  type PopupMenuItem,
   readHostCliScrollConfig,
-  resolveAgentAccent,
+  resolveHostAgentAccent,
   setPointer,
+  SplitBorder,
   titlecaseAgent,
   useHostSyntaxStyle,
 } from "./ui-primitives.tsx"
@@ -75,126 +84,211 @@ export interface SessionPanelProps {
   readonly updateMemory: UpdateTuiMemory
 }
 
-function tabLabel(item: HubItem): string {
-  const shortText = (item.label || item.title).slice(0, 22)
-  if (item.kind === "btw") {
-    const alias = item.alias.startsWith("#") ? item.alias : `#${item.index}`
-    return `◈ ${alias} ${shortText}`
-  }
-  if (item.kind === "sub") return `✦ @${item.agent ?? "agent"} ${shortText}`
-  return `${"›".repeat(Math.max(0, item.depth - 1))}@${item.agent ?? "agent"} ${shortText}`
+interface ContextMenuState {
+  readonly x: number
+  readonly y: number
+  readonly item?: HubItem
 }
 
-function SessionTabPill(props: {
+function tabTitleText(item: HubItem): string {
+  const isDefaultForkTitle = item.kind === "btw" && /\(fork #\d+\)$/.test(item.title)
+  const title = (isDefaultForkTitle ? item.label : item.title || item.label) || item.sessionID
+  if (item.kind === "btw") {
+    const alias = item.alias.startsWith("#") ? item.alias : `#${item.index}`
+    return `◈ ${alias} ${title}`
+  }
+  if (item.kind === "sub") return `✦ @${item.agent ?? "agent"} ${title}`
+  return `${"›".repeat(Math.max(0, item.depth - 1))}@${item.agent ?? "agent"} ${title}`
+}
+
+function AdaptiveTabCell(props: {
   readonly context: Plugin.Context
   readonly item: HubItem
+  readonly width: number
   readonly selected: boolean
   readonly running: boolean
   readonly unread: boolean
+  readonly newDesigns: boolean
   readonly onActivateHost: () => void
   readonly onSelect: () => void
-  readonly onHide?: () => void
+  readonly onMiddleClose: () => void
+  readonly onRightMenu: (event: MouseEvent) => void
 }) {
   const theme = props.context.theme
   const [hovered, setHovered] = createSignal(false)
-  const [closeHovered, setCloseHovered] = createSignal(false)
-  const accent = createMemo(() => resolveAgentAccent(theme, props.item.agent))
+  const accent = createMemo(() => resolveHostAgentAccent(props.context, props.item.agent, props.newDesigns))
 
   onCleanup(() => {
-    if (hovered() || closeHovered()) setPointer(props.context, "default")
+    if (hovered()) setPointer(props.context, "default")
   })
 
   const bg = createMemo(() => {
     if (props.selected) return theme.background.raised.max
     if (hovered()) return theme.background.raised.high
-    return theme.background.raised.base
+    return undefined
   })
+
+  const hasIndicator = () => props.running || props.unread
 
   return (
     <box
+      width={props.width}
       height={1}
       flexShrink={0}
       flexDirection="row"
+      alignItems="center"
       backgroundColor={bg()}
-      border={["left"]}
-      borderColor={props.selected ? accent() : bg()}
-      customBorderChars={{
-        ...EmptyBorder,
-        vertical: props.selected ? "┃" : " ",
+      border={props.selected ? ["left"] : undefined}
+      borderColor={props.selected ? accent() : undefined}
+      customBorderChars={SplitBorder.customBorderChars}
+      paddingLeft={1}
+      paddingRight={1}
+      onMouseOver={() => {
+        setHovered(true)
+        setPointer(props.context, "pointer")
+      }}
+      onMouseOut={() => {
+        setHovered(false)
+        setPointer(props.context, "default")
+      }}
+      onMouseDown={(event: MouseEvent) => {
+        if (event.button === MouseButton.MIDDLE) {
+          event.preventDefault()
+          event.stopPropagation()
+          props.onMiddleClose()
+          return
+        }
+        if (event.button === MouseButton.RIGHT) {
+          event.preventDefault()
+          event.stopPropagation()
+          props.onRightMenu(event)
+          return
+        }
+        if (event.button !== MouseButton.LEFT) return
+        props.onActivateHost()
+        event.stopPropagation()
+      }}
+      onMouseUp={(event: MouseEvent) => {
+        if (event.button !== MouseButton.LEFT) return
+        event.stopPropagation()
+        props.onSelect()
       }}
     >
-      <box
-        height={1}
-        paddingLeft={1}
-        paddingRight={props.onHide ? 0 : 1}
-        onMouseOver={() => {
-          setHovered(true)
-          setPointer(props.context, "pointer")
-        }}
-        onMouseOut={() => {
-          setHovered(false)
-          setPointer(props.context, "default")
-        }}
-        onMouseDown={(event: MouseEvent) => {
-          if (event.button !== MouseButton.LEFT) return
-          props.onActivateHost()
-          event.stopPropagation()
-        }}
-        onMouseUp={(event: MouseEvent) => {
-          if (event.button !== MouseButton.LEFT) return
-          event.stopPropagation()
-          props.onSelect()
-        }}
+      <text
+        fg={props.selected || hovered() ? theme.text.base : theme.text.muted}
+        attributes={props.selected ? TextAttributes.BOLD : undefined}
+        wrapMode="none"
+        truncate
+        flexGrow={1}
+        minWidth={0}
+        selectable={false}
       >
+        {tabTitleText(props.item)}
+      </text>
+      <Show when={hasIndicator()}>
         <text
-          fg={props.selected || hovered() ? theme.text.base : theme.text.muted}
-          attributes={props.selected ? TextAttributes.BOLD : undefined}
+          fg={props.running ? theme.text.feedback.info.base : theme.text.feedback.warning.base}
           wrapMode="none"
+          flexShrink={0}
           selectable={false}
         >
-          {tabLabel(props.item)}
-          <Show when={props.running}>
-            <span style={{ fg: theme.text.feedback.info.base }}>{" ●"}</span>
-          </Show>
-          <Show when={!props.running && props.unread}>
-            <span style={{ fg: theme.text.feedback.warning.base }}>{" •"}</span>
-          </Show>
+          {props.running ? " ●" : " •"}
         </text>
-      </box>
-      <Show when={props.onHide}>
-        {(onHide) => (
-          <box
-            height={1}
-            paddingLeft={1}
-            paddingRight={1}
-            backgroundColor={closeHovered() ? theme.background.raised.max : undefined}
-            onMouseOver={() => {
-              setCloseHovered(true)
-              setPointer(props.context, "pointer")
-            }}
-            onMouseOut={() => {
-              setCloseHovered(false)
-              setPointer(props.context, "default")
-            }}
-            onMouseDown={(event: MouseEvent) => {
-              if (event.button !== MouseButton.LEFT) return
-              props.onActivateHost()
-              event.stopPropagation()
-            }}
-            onMouseUp={(event: MouseEvent) => {
-              if (event.button !== MouseButton.LEFT) return
-              event.stopPropagation()
-              onHide()()
-            }}
-          >
-            <text
-              fg={closeHovered() ? theme.text.feedback.error.base : theme.text.faint}
-              wrapMode="none"
-              selectable={false}
-            >
-              ×
-            </text>
-          </box>
+      </Show>
+    </box>
+  )
+}
+
+function ShellToolCard(props: {
+  readonly context: Plugin.Context
+  readonly row: Extract<MessageRow, { kind: "tool" }>
+  readonly theme: Theme
+  readonly expanded: boolean
+  readonly onActivateHost: () => void
+  readonly onToggle: () => void
+}) {
+  const [hovered, setHovered] = createSignal(false)
+  const rawCommand = () => {
+    const cmd = props.row.command ?? ""
+    const wd = props.row.workdir
+    const prefix = wd && wd !== "." ? `cd ${wd} && ` : ""
+    return cmd ? `$ ${prefix}${cmd}` : props.row.text
+  }
+  const rawOutput = () => props.row.output ?? ""
+  const collapsed = createMemo(() => collapseShellPreview(rawCommand(), rawOutput(), 8, 160))
+  const expandable = createMemo(() => collapsed().overflow || Boolean(rawOutput()) || Boolean(props.row.error))
+
+  onCleanup(() => {
+    if (hovered()) setPointer(props.context, "default")
+  })
+
+  const baseBg = () => props.theme.decrease(props.theme.background.raised.base)
+  const cardBg = () => (hovered() && expandable() ? props.theme.background.raised.high : baseBg())
+
+  return (
+    <box
+      flexDirection="column"
+      flexShrink={0}
+      marginLeft={1}
+      marginRight={1}
+      marginBottom={1}
+      border={["left"]}
+      borderColor={props.row.status === "error" ? props.theme.text.feedback.error.base : props.theme.border.base}
+      customBorderChars={SplitBorder.customBorderChars}
+      backgroundColor={cardBg()}
+      paddingLeft={2}
+      paddingRight={2}
+      paddingTop={1}
+      paddingBottom={1}
+      gap={1}
+      onMouseOver={() => {
+        if (!expandable()) return
+        setHovered(true)
+        setPointer(props.context, "pointer")
+      }}
+      onMouseOut={() => {
+        setHovered(false)
+        setPointer(props.context, "default")
+      }}
+      onMouseDown={(event: MouseEvent) => {
+        if (event.button !== MouseButton.LEFT) return
+        props.onActivateHost()
+        event.stopPropagation()
+      }}
+      onMouseUp={(event: MouseEvent) => {
+        if (event.button !== MouseButton.LEFT || !expandable()) return
+        if (props.context.renderer.getSelection()?.getSelectedText()) return
+        event.stopPropagation()
+        props.onToggle()
+      }}
+    >
+      <text
+        fg={props.row.status === "running" ? props.theme.text.feedback.info.base : props.theme.text.base}
+        wrapMode={props.expanded ? "word" : "char"}
+        maxHeight={props.expanded ? undefined : 2}
+      >
+        {props.expanded ? rawCommand() : collapsed().commandLine}
+      </text>
+
+      <Show when={props.expanded ? rawOutput() : collapsed().previewOutput}>
+        {(out) => (
+          <text fg={props.theme.text.muted} wrapMode="word">
+            {out()}
+          </text>
+        )}
+      </Show>
+
+      <Show when={!props.expanded && collapsed().hiddenLines > 0}>
+        <text fg={props.theme.text.faint} wrapMode="none" selectable={false}>
+          {`… +${collapsed().hiddenLines} lines`}
+        </text>
+      </Show>
+
+      <Show when={props.row.error}>
+        {(err) => (
+          <text fg={props.theme.text.feedback.error.base} wrapMode="word">
+            {err()}
+          </text>
         )}
       </Show>
     </box>
@@ -205,7 +299,8 @@ function TranscriptRow(props: {
   readonly context: Plugin.Context
   readonly row: MessageRow
   readonly theme: Theme
-  readonly accent: ReturnType<typeof resolveAgentAccent>
+  readonly newDesigns: boolean
+  readonly accent: RGBA
   readonly syntaxStyle: ReturnType<ReturnType<typeof useHostSyntaxStyle>>
   readonly expanded: boolean
   readonly copied: boolean
@@ -214,30 +309,31 @@ function TranscriptRow(props: {
   readonly onCopy: (text: string, id: string) => void
 }) {
   const row = props.row
-  const [reasonHover, setReasonHover] = createSignal(false)
+  const [hovered, setHovered] = createSignal(false)
 
+  onCleanup(() => {
+    if (hovered()) setPointer(props.context, "default")
+  })
+
+  // 1. Native-aligned Reasoning block (`+ Thought: ... · 3.5s` in warning gold)
   if (row.kind === "reasoning") {
-    const seconds = row.elapsedMs === undefined ? "" : ` ${(row.elapsedMs / 1000).toFixed(1)}s`
+    const duration = row.elapsedMs !== undefined ? formatDurationCompact(row.elapsedMs) : undefined
+    const headerFg = () => {
+      const warn = props.theme.text.feedback.warning.base
+      return props.expanded ? RGBA.fromValues(warn.r, warn.g, warn.b, 0.65) : warn
+    }
     return (
-      <box
-        flexDirection="column"
-        flexShrink={0}
-        paddingLeft={2}
-        paddingRight={1}
-        marginBottom={1}
-      >
+      <box flexDirection="column" flexShrink={0} paddingLeft={3} paddingRight={2} marginBottom={1}>
         <box
           height={1}
           flexShrink={0}
-          paddingLeft={1}
-          paddingRight={1}
-          backgroundColor={reasonHover() ? props.theme.background.raised.high : undefined}
+          backgroundColor={hovered() ? props.theme.background.raised.high : undefined}
           onMouseOver={() => {
-            setReasonHover(true)
+            setHovered(true)
             setPointer(props.context, "pointer")
           }}
           onMouseOut={() => {
-            setReasonHover(false)
+            setHovered(false)
             setPointer(props.context, "default")
           }}
           onMouseDown={(event: MouseEvent) => {
@@ -247,6 +343,7 @@ function TranscriptRow(props: {
           }}
           onMouseUp={(event: MouseEvent) => {
             if (event.button !== MouseButton.LEFT) return
+            if (props.context.renderer.getSelection()?.getSelectedText()) return
             event.stopPropagation()
             props.onToggle()
           }}
@@ -256,63 +353,188 @@ function TranscriptRow(props: {
             props.onToggle()
           }}
         >
-          <text fg={reasonHover() ? props.theme.text.base : props.theme.text.muted} wrapMode="none" selectable={false}>
-            {`${props.expanded ? "▾" : "▸"} 思考过程${seconds}`}
-            <Show when={!props.expanded}>
-              <span style={{ fg: props.theme.text.faint }}>{` · ${row.preview}`}</span>
+          <text fg={headerFg()} wrapMode="none" truncate selectable={false}>
+            <Show
+              when={row.done}
+              fallback={<span>{`⟳ Thinking${row.preview ? `: ${row.preview}` : "…"}`}</span>}
+            >
+              <span>{props.expanded ? "- Thought" : "+ Thought"}</span>
+              <Show when={!props.expanded && row.preview}>
+                <span>{`: ${row.preview}`}</span>
+              </Show>
+              <Show when={duration}>
+                {(d) => <span>{`${!props.expanded && row.preview ? " · " : ": "}${d()}`}</span>}
+              </Show>
             </Show>
           </text>
         </box>
         <Show when={props.expanded}>
           <box
+            marginTop={1}
             border={["left"]}
             borderColor={props.theme.border.base}
-            customBorderChars={{ ...EmptyBorder, vertical: "│" }}
+            customBorderChars={SplitBorder.customBorderChars}
             paddingLeft={2}
-            marginLeft={1}
           >
-            <text fg={props.theme.text.muted} wrapMode="word">
-              {row.text}
-            </text>
+            <markdown
+              content={row.text}
+              streaming={!row.done}
+              conceal
+              internalBlockMode="top-level"
+              syntaxStyle={props.syntaxStyle}
+              fg={props.theme.text.muted}
+            />
           </box>
         </Show>
       </box>
     )
   }
 
+  // 2. Native-aligned expandable `$ shell` block or expandable inline tool row
   if (row.kind === "tool") {
+    if (row.isShell) {
+      return (
+        <ShellToolCard
+          context={props.context}
+          row={row}
+          theme={props.theme}
+          expanded={props.expanded}
+          onActivateHost={props.onActivateHost}
+          onToggle={props.onToggle}
+        />
+      )
+    }
+
+    const expandable = Boolean(row.detail || row.error)
     return (
-      <box flexDirection="column" flexShrink={0} paddingLeft={3} paddingRight={2} marginBottom={row.status === "error" ? 1 : 0}>
-        <text
-          fg={row.status === "error" ? props.theme.text.feedback.error.base : props.theme.text.muted}
-          wrapMode="none"
-          truncate={row.status !== "error"}
+      <box flexDirection="column" flexShrink={0} paddingLeft={3} paddingRight={2}>
+        <box
+          height={1}
+          flexShrink={0}
+          backgroundColor={hovered() && expandable ? props.theme.background.raised.high : undefined}
+          onMouseOver={() => {
+            if (!expandable) return
+            setHovered(true)
+            setPointer(props.context, "pointer")
+          }}
+          onMouseOut={() => {
+            setHovered(false)
+            setPointer(props.context, "default")
+          }}
+          onMouseDown={(event: MouseEvent) => {
+            if (event.button !== MouseButton.LEFT || !expandable) return
+            props.onActivateHost()
+            event.stopPropagation()
+          }}
+          onMouseUp={(event: MouseEvent) => {
+            if (event.button !== MouseButton.LEFT || !expandable) return
+            if (props.context.renderer.getSelection()?.getSelectedText()) return
+            event.stopPropagation()
+            props.onToggle()
+          }}
         >
-          {row.text}
-        </text>
-        <Show when={row.status === "error" && row.error}>
-          {(error) => <text fg={props.theme.text.feedback.error.muted} wrapMode="word">{`  ${error()}`}</text>}
+          <text
+            fg={
+              row.status === "error"
+                ? props.theme.text.feedback.error.base
+                : hovered() && expandable
+                  ? props.theme.text.base
+                  : props.theme.text.muted
+            }
+            wrapMode="none"
+            truncate
+          >
+            {row.text}
+          </text>
+        </box>
+        <Show when={props.expanded && (row.detail || row.error)}>
+          <box
+            marginLeft={1}
+            marginBottom={1}
+            border={["left"]}
+            borderColor={row.status === "error" ? props.theme.text.feedback.error.base : props.theme.border.base}
+            customBorderChars={SplitBorder.customBorderChars}
+            backgroundColor={props.theme.decrease(props.theme.background.raised.base)}
+            paddingLeft={2}
+            paddingRight={1}
+          >
+            <Show when={row.detail}>
+              {(detail) => (
+                <text fg={props.theme.text.muted} wrapMode="word">
+                  {detail()}
+                </text>
+              )}
+            </Show>
+            <Show when={row.error}>
+              {(err) => (
+                <text fg={props.theme.text.feedback.error.base} wrapMode="word">
+                  {err()}
+                </text>
+              )}
+            </Show>
+          </box>
         </Show>
       </box>
     )
   }
 
+  // 3. Native-aligned assistant signature & quiet copy footer (`Agent · Model · duration   ⧉ copy`)
   if (row.kind === "copy") {
+    const rowAccent = createMemo(() => resolveHostAgentAccent(props.context, row.agent, props.newDesigns))
+    const modelMeta = createMemo(() => (row.model ? resolveModelDisplay(props.context, row.model) : undefined))
+    const duration = formatDurationCompact(row.durationMs)
     return (
-      <box height={1} flexShrink={0} flexDirection="row" justifyContent="flex-end" paddingRight={2} marginBottom={1}>
-        <GuiButton
-          context={props.context}
-          label={props.copied ? "已复制" : "复制"}
-          icon={props.copied ? "✓" : "⧉"}
-          shortcut={props.copied ? undefined : "c"}
-          variant={props.copied ? "success" : "ghost"}
-          onActivateHost={props.onActivateHost}
-          onClick={() => props.onCopy(row.text, row.id)}
-        />
+      <box
+        height={1}
+        flexShrink={0}
+        flexDirection="row"
+        justifyContent="space-between"
+        alignItems="center"
+        paddingLeft={3}
+        paddingRight={2}
+        marginBottom={1}
+      >
+        <box flexDirection="row" gap={1} flexGrow={1} minWidth={0}>
+          <Show when={row.agent}>
+            {(agent) => (
+              <text fg={rowAccent()} wrapMode="none" flexShrink={0} selectable={false}>
+                {titlecaseAgent(agent())}
+              </text>
+            )}
+          </Show>
+          <Show when={modelMeta()?.modelName}>
+            {(modelName) => (
+              <>
+                <text fg={props.theme.text.muted} wrapMode="none" flexShrink={0} selectable={false}>
+                  ·
+                </text>
+                <text fg={props.theme.text.muted} wrapMode="none" truncate flexShrink={1} minWidth={0} selectable={false}>
+                  {modelName()}
+                </text>
+              </>
+            )}
+          </Show>
+          <Show when={duration}>
+            <text fg={props.theme.text.muted} wrapMode="none" flexShrink={0} selectable={false}>
+              {`· ${duration}`}
+            </text>
+          </Show>
+        </box>
+        <Show when={row.text}>
+          <GuiButton
+            context={props.context}
+            label={props.copied ? "copied" : "copy"}
+            icon={props.copied ? "✓" : "⧉"}
+            variant={props.copied ? "success" : "ghost"}
+            onActivateHost={props.onActivateHost}
+            onClick={() => props.onCopy(row.text, row.id)}
+          />
+        </Show>
       </box>
     )
   }
 
+  // 4. Assistant Markdown body
   if (row.kind === "assistant") {
     return (
       <box flexShrink={0} paddingLeft={3} paddingRight={2} paddingTop={0} paddingBottom={0}>
@@ -329,6 +551,7 @@ function TranscriptRow(props: {
     )
   }
 
+  // 5. User / Synthetic / System message card
   const cardBg = props.theme.decrease(props.theme.background.raised.base)
   const barColor =
     row.kind === "user"
@@ -345,7 +568,7 @@ function TranscriptRow(props: {
       marginBottom={1}
       border={["left"]}
       borderColor={barColor}
-      customBorderChars={{ ...EmptyBorder, vertical: "┃" }}
+      customBorderChars={SplitBorder.customBorderChars}
     >
       <box
         flexDirection="column"
@@ -357,7 +580,7 @@ function TranscriptRow(props: {
       >
         <Show when={row.kind !== "user"}>
           <text fg={barColor} attributes={TextAttributes.BOLD} wrapMode="none" selectable={false}>
-            {row.kind === "synthetic" ? "◈ 跨会话投递" : "系统提示"}
+            {row.kind === "synthetic" ? `◈ ${row.description || "跨会话来信"}` : row.description || "系统提示"}
           </text>
         </Show>
         <text fg={props.theme.text.base} wrapMode="word">
@@ -380,15 +603,33 @@ export function SessionPanel(props: SessionPanelProps) {
   const rootSessionID = createMemo(() => resolveRootSessionID(context, props.input.sessionID))
   const [remoteItems, setRemoteItems] = createSignal<readonly HubItem[]>([])
   const [hubError, setHubError] = createSignal("")
-  const [historyOpen, setHistoryOpen] = createSignal(false)
-  const [expandedReasoning, setExpandedReasoning] = createSignal<ReadonlySet<string>>(new Set())
+  const [expandedRows, setExpandedRows] = createSignal<ReadonlySet<string>>(new Set())
   const [away, setAway] = createSignal(false)
   const [unread, setUnread] = createSignal<ReadonlySet<string>>(new Set())
   const [copiedID, setCopiedID] = createSignal("")
+  const [tabWindowStart, setTabWindowStart] = createSignal(0)
+  const [contextMenu, setContextMenu] = createSignal<ContextMenuState>()
+  const [localMessages, setLocalMessages] = createSignal<readonly SessionMessage[]>([])
   let refreshRevision = 0
+  let messageFetchRevision = 0
   let transcript: ScrollBoxRenderable | undefined
   let composer: TextareaRenderable | undefined
   let removeScrollListener: (() => void) | undefined
+
+  const fetchPanelMessages = async (sessionID: string): Promise<void> => {
+    const rev = ++messageFetchRevision
+    try {
+      const response = await context.client.message.list({
+        sessionID,
+        limit: 150,
+        order: "desc",
+      })
+      if (rev !== messageFetchRevision || selectedID() !== sessionID) return
+      setLocalMessages(response.data.slice().reverse())
+    } catch {
+      // Ignore transient races while a brand-new session commits
+    }
+  }
 
   const refresh = async (): Promise<void> => {
     const root = rootSessionID()
@@ -410,15 +651,26 @@ export function SessionPanel(props: SessionPanelProps) {
     const offEvents = context.data.listen(({ details }) => {
       const id = selectedID()
       if (!id) return
+      const applied = applyPanelStreamEvent(untrack(localMessages), details, id)
+      if (applied.next !== untrack(localMessages)) {
+        setLocalMessages(applied.next)
+      }
+      if (applied.shouldRefetch) {
+        void fetchPanelMessages(id)
+      }
       if (
         (details.type === "session.idle" ||
           details.type === "session.step.ended" ||
-          details.type === "session.inbox.enqueued") &&
+          details.type === "session.inbox.enqueued" ||
+          details.type === "session.renamed") &&
         "sessionID" in details.data &&
         details.data.sessionID === id
       ) {
+        context.data.session.invalidate(id)
         context.data.session.message.invalidate(id)
+        void context.data.session.sync(id).catch(() => undefined)
         void context.data.session.message.sync(id).catch(() => undefined)
+        void refresh()
       }
     })
     onCleanup(() => {
@@ -430,7 +682,7 @@ export function SessionPanel(props: SessionPanelProps) {
   createEffect(
     on(rootSessionID, () => {
       setRemoteItems([])
-      setHistoryOpen(false)
+      setTabWindowStart(0)
       void refresh()
     }),
   )
@@ -444,13 +696,27 @@ export function SessionPanel(props: SessionPanelProps) {
     const request = props.memory.composer
     return request?.rootSessionID === rootSessionID() ? request : undefined
   })
+
+  // Adaptive tab layout matching OpenCode v2 top bar (reserves 4 cols for `+` button)
+  const tabLayout = createMemo(() => {
+    const activeID = creation() ? undefined : selectedID()
+    const available = Math.max(12, props.input.width - 4)
+    return adaptiveAsideTabLayout(visible(), activeID, available, untrack(tabWindowStart))
+  })
+  createEffect(() => {
+    setTabWindowStart(tabLayout().start)
+  })
+
   const running = createMemo(() => {
     const id = selectedID()
     return id !== undefined && context.data.session.status(id) === "running"
   })
   const messages = createMemo(() => {
     const id = selectedID()
-    return id ? context.data.session.message.list(id) : []
+    if (!id) return []
+    const host = context.data.session.message.list(id)
+    const mirror = localMessages()
+    return host.length >= mirror.length && host.length > 0 ? host : mirror
   })
   const rows = createMemo(() => formatMessageRows(messages()))
   const composerKey = createMemo(() => {
@@ -460,7 +726,6 @@ export function SessionPanel(props: SessionPanelProps) {
   })
   const agents = createMemo(() => availableSubagents(context.data.location.agent.list(context.location) ?? []))
 
-  // Ensure keyboard focus lands inside composer whenever the host focuses the panel shell
   createEffect(() => {
     if (!props.input.focused) return
     queueMicrotask(() => {
@@ -527,10 +792,11 @@ export function SessionPanel(props: SessionPanelProps) {
   createEffect(
     on(selectedID, (sessionID, previous) => {
       if (previous && previous !== sessionID) saveScroll(previous)
-      setHistoryOpen(false)
-      setExpandedReasoning(new Set<string>())
+      setExpandedRows(new Set<string>())
+      setLocalMessages([])
       if (!sessionID) return
       forceSyncSession(context, sessionID)
+      void fetchPanelMessages(sessionID)
       const saved = untrack(() => props.memory.scrollOffsets[sessionID] ?? 0)
       setAway(saved > 0)
       queueMicrotask(() => {
@@ -589,7 +855,23 @@ export function SessionPanel(props: SessionPanelProps) {
       await rpc.setHidden({ sessionID: item.sessionID, hidden: false }, rpcOptions(context))
       await refresh()
       select(item.sessionID)
-      if (hidden().length === 0) setHistoryOpen(false)
+    } catch (error: unknown) {
+      context.ui.toast.show({ message: errorMessage(error), variant: "error" })
+    }
+  }
+  const renameTab = async (item: HubItem): Promise<void> => {
+    const nextTitle = await context.ui.dialog.prompt({
+      title: "Rename session",
+      value: item.title || item.label,
+      placeholder: "Session title",
+    })
+    const trimmed = nextTitle?.trim()
+    if (!trimmed || trimmed === item.title) return
+    try {
+      await context.client.session.update({ sessionID: item.sessionID, title: trimmed })
+      context.data.session.invalidate(item.sessionID)
+      await context.data.session.sync(item.sessionID)
+      await refresh()
     } catch (error: unknown) {
       context.ui.toast.show({ message: errorMessage(error), variant: "error" })
     }
@@ -610,7 +892,7 @@ export function SessionPanel(props: SessionPanelProps) {
     try {
       await rpc.handoff({ fromSessionID: id, toSessionID: rootSessionID(), delivery }, rpcOptions(context))
       context.ui.toast.show({
-        message: delivery === "park" ? "已挂入主线收件箱（随轮生效）" : "已唤醒主线并送回最新结论",
+        message: delivery === "park" ? "已挂入主线收件箱（随轮生效）" : "已唤醒主线并送回结论",
         variant: "success",
         sessionID: rootSessionID(),
       })
@@ -627,19 +909,18 @@ export function SessionPanel(props: SessionPanelProps) {
       context.ui.toast.show({ message: errorMessage(error), variant: "error" })
     }
   }
-  const openNative = (): void => {
-    const id = selectedID()
-    if (!id) return
-    saveScroll(id)
+  const openNativeSession = (sessionID: string | undefined): void => {
+    if (!sessionID) return
+    saveScroll(sessionID)
     props.updateMemory((draft) => {
-      draft.nativeReturn = { rootSessionID: rootSessionID(), selectedID: id }
+      draft.nativeReturn = { rootSessionID: rootSessionID(), selectedID: sessionID }
     })
     props.input.close()
-    context.ui.router.navigate({ type: "session", sessionID: id })
+    context.ui.router.navigate({ type: "session", sessionID })
   }
   const escape = (): void => {
-    if (historyOpen()) {
-      setHistoryOpen(false)
+    if (contextMenu()) {
+      setContextMenu(undefined)
       return
     }
     const id = selectedID()
@@ -651,13 +932,74 @@ export function SessionPanel(props: SessionPanelProps) {
     const ok = context.renderer.copyToClipboardOSC52(text)
     if (ok) setCopiedID(id)
     context.ui.toast.show({
-      message: ok ? "已复制助手回复" : "剪贴板不可用（OSC52 写入失败）",
+      message: ok ? "已复制内容" : "剪贴板不可用（OSC52 写入失败）",
       variant: ok ? "success" : "error",
     })
   }
   const copyLatest = (): void => {
-    const row = rows().findLast((item) => item.kind === "copy")
+    const row = rows().findLast((item) => item.kind === "copy" && item.text.length > 0)
     if (row) copy(row.text, row.id)
+  }
+
+  const buildContextMenuItems = (state: ContextMenuState): readonly PopupMenuItem[] => {
+    const target = state.item
+    const newActions: PopupMenuItem[] = [
+      {
+        title: "New /btw aside",
+        run: () => openInlineComposer(context, props.updateMemory, rootSessionID(), "btw"),
+      },
+      {
+        title: "New /sub agent",
+        run: () =>
+          openInlineComposer(
+            context,
+            props.updateMemory,
+            rootSessionID(),
+            "sub",
+            agents()[0]?.id ?? "explore",
+          ),
+      },
+    ]
+
+    if (target) {
+      return [
+        ...newActions,
+        {
+          title: "Rename",
+          run: () => void renameTab(target),
+        },
+        {
+          title: "Copy session ID",
+          run: () => {
+            const ok = context.renderer.copyToClipboardOSC52(target.sessionID)
+            context.ui.toast.show({
+              message: ok ? "Session ID copied to clipboard" : "Failed to copy session ID",
+              variant: ok ? "info" : "error",
+            })
+          },
+        },
+        {
+          title: "Open native view",
+          run: () => openNativeSession(target.sessionID),
+        },
+        {
+          title: "Close",
+          run: () => void hide(target),
+        },
+      ]
+    }
+
+    const closed = hidden().slice().reverse().slice(0, 10)
+    return [
+      ...newActions,
+      { title: "Recently closed tabs" },
+      ...(closed.length > 0
+        ? closed.map((item) => ({
+            title: `  ${tabTitleText(item)}`,
+            run: () => void restore(item),
+          }))
+        : [{ title: "  No recently closed tabs" }]),
+    ]
   }
 
   const submitComposer = async (queue: boolean): Promise<void> => {
@@ -691,6 +1033,7 @@ export function SessionPanel(props: SessionPanelProps) {
       if (!selectedAtSubmit) return
       const isRunning = context.data.session.status(selectedAtSubmit) === "running"
       await sendSessionPrompt(context, selectedAtSubmit, text, isRunning ? (queue ? "queue" : "steer") : undefined)
+      await fetchPanelMessages(selectedAtSubmit)
     } catch (error: unknown) {
       context.ui.toast.show({ message: errorMessage(error), variant: "error" })
       if (composerKey() === key && composer && !composer.isDestroyed && !composer.plainText) {
@@ -747,21 +1090,17 @@ export function SessionPanel(props: SessionPanelProps) {
   const currentAgentID = createMemo(() => {
     const req = creation()
     if (req?.kind === "sub") return req.agentID ?? agents()[0]?.id ?? "explore"
-    if (req?.kind === "btw") return context.data.session.get(rootSessionID())?.agent ?? "btw"
-    return selected()?.agent ?? context.data.session.get(selectedID() ?? "")?.agent ?? "aside"
+    if (req?.kind === "btw") return context.data.session.get(rootSessionID())?.agent ?? "build"
+    return selected()?.agent ?? context.data.session.get(selectedID() ?? "")?.agent ?? "build"
   })
-  const currentAccent = createMemo(() => resolveAgentAccent(theme, currentAgentID()))
+  const currentAccent = createMemo(() =>
+    resolveHostAgentAccent(context, currentAgentID(), scrollConfig.newDesigns),
+  )
   const currentModelDisplay = createMemo(() => {
     const item = selected()
     if (creation()) return resolveModelDisplay(context, undefined)
     return resolveModelDisplay(context, item?.model)
   })
-  const footerHint = () => {
-    if (creation()) return "Enter 创建并发送  ·  Shift+Enter 换行  ·  Esc 回主会话"
-    return running()
-      ? "Enter 插队纠偏(Steer)  ·  Alt+Enter 排队  ·  Ctrl+X 中断  ·  Esc 回主会话"
-      : "Enter 追问  ·  Alt+[ / ] 切标签  ·  Ctrl+H 送回主线  ·  Esc 回主会话"
-  }
 
   return (
     <box
@@ -772,121 +1111,102 @@ export function SessionPanel(props: SessionPanelProps) {
       minHeight={0}
       backgroundColor={theme.background.raised.base}
     >
-      {/* Layer 1: GUI Tab Strip with hoverable pills and non-destructive history drawer */}
+      {/* Layer 1: Adaptive Tab Strip matching OpenCode v2 SessionTabs + Right-Click Context Menu */}
       <box
         height={1}
         flexShrink={0}
         flexDirection="row"
+        alignItems="center"
         justifyContent="space-between"
         backgroundColor={theme.background.base}
-        paddingLeft={1}
-        paddingRight={1}
-        gap={1}
+        onMouseDown={(event: MouseEvent) => {
+          if (event.button === MouseButton.RIGHT) {
+            event.preventDefault()
+            event.stopPropagation()
+            setContextMenu({ x: event.x, y: event.y })
+          }
+        }}
+        onMouseScroll={(event) => {
+          const dir = event.scroll?.direction
+          if (dir === "up" || dir === "left") {
+            const prev = nextTabID(items(), selectedID(), -1)
+            if (prev) select(prev)
+          } else if (dir === "down" || dir === "right") {
+            const next = nextTabID(items(), selectedID(), 1)
+            if (next) select(next)
+          }
+        }}
       >
-        <scrollbox
-          height={1}
-          flexGrow={1}
-          flexBasis={0}
-          minWidth={0}
-          scrollX
-          scrollY={false}
-          scrollbarOptions={{ visible: false }}
-        >
-          <box flexDirection="row" flexShrink={0} gap={1}>
-            <For each={visible()}>
-              {(item) => (
-                <SessionTabPill
-                  context={context}
-                  item={item}
-                  selected={selectedID() === item.sessionID && !creation()}
-                  running={context.data.session.status(item.sessionID) === "running"}
-                  unread={unread().has(item.sessionID)}
-                  onActivateHost={props.input.focus}
-                  onSelect={() => select(item.sessionID)}
-                  onHide={item.kind !== "subagent" ? () => void hide(item) : undefined}
-                />
-              )}
-            </For>
-          </box>
-        </scrollbox>
-
-        <box flexDirection="row" flexShrink={0} gap={1}>
-          <GuiButton
-            context={context}
-            icon="+"
-            label="btw"
-            variant="secondary"
-            active={creation()?.kind === "btw"}
-            onActivateHost={props.input.focus}
-            onClick={() => openInlineComposer(context, props.updateMemory, rootSessionID(), "btw")}
-          />
-          <GuiButton
-            context={context}
-            icon="✦"
-            label="sub"
-            variant="secondary"
-            active={creation()?.kind === "sub"}
-            onActivateHost={props.input.focus}
-            onClick={() =>
-              openInlineComposer(
-                context,
-                props.updateMemory,
-                rootSessionID(),
-                "sub",
-                agents()[0]?.id ?? "explore",
-              )
-            }
-          />
-          <Show when={hidden().length > 0 || historyOpen()}>
+        <box height={1} flexDirection="row" flexGrow={1} minWidth={0} alignItems="center">
+          <Show when={tabLayout().before > 0}>
             <GuiButton
               context={context}
-              icon={historyOpen() ? "▴" : "▾"}
-              label={`历史 ${hidden().length}`}
+              label={`‹${tabLayout().before}`}
               variant="ghost"
-              active={historyOpen()}
+              paddingX={0}
               onActivateHost={props.input.focus}
-              onClick={() => setHistoryOpen((value) => !value)}
+              onClick={() => {
+                const targetIdx = Math.max(0, tabLayout().start - 1)
+                const item = visible()[targetIdx]
+                if (item) select(item.sessionID)
+              }}
+            />
+          </Show>
+
+          <For each={tabLayout().tabs}>
+            {(item, idx) => (
+              <AdaptiveTabCell
+                context={context}
+                item={item}
+                width={tabLayout().widths[idx()] ?? 12}
+                selected={selectedID() === item.sessionID && !creation()}
+                running={context.data.session.status(item.sessionID) === "running"}
+                unread={unread().has(item.sessionID)}
+                newDesigns={scrollConfig.newDesigns}
+                onActivateHost={props.input.focus}
+                onSelect={() => select(item.sessionID)}
+                onMiddleClose={() => void hide(item)}
+                onRightMenu={(event) => setContextMenu({ x: event.x, y: event.y, item })}
+              />
+            )}
+          </For>
+
+          <Show when={tabLayout().after > 0}>
+            <GuiButton
+              context={context}
+              label={`${tabLayout().after}›`}
+              variant="ghost"
+              paddingX={0}
+              onActivateHost={props.input.focus}
+              onClick={() => {
+                const targetIdx = Math.min(visible().length - 1, tabLayout().start + tabLayout().tabs.length)
+                const item = visible()[targetIdx]
+                if (item) select(item.sessionID)
+              }}
             />
           </Show>
         </box>
+
+        <GuiButton
+          context={context}
+          label="+"
+          variant="ghost"
+          active={Boolean(creation())}
+          onActivateHost={props.input.focus}
+          onRightClick={(event) => setContextMenu({ x: event.x, y: event.y })}
+          onClick={(shift) =>
+            openInlineComposer(
+              context,
+              props.updateMemory,
+              rootSessionID(),
+              shift ? "sub" : "btw",
+              shift ? (agents()[0]?.id ?? "explore") : undefined,
+            )
+          }
+        />
       </box>
 
-      <Show when={historyOpen()}>
-        <box
-          flexDirection="column"
-          flexShrink={0}
-          backgroundColor={theme.background.raised.high}
-          paddingLeft={2}
-          paddingRight={2}
-          paddingTop={1}
-          paddingBottom={1}
-          gap={1}
-          border={["bottom"]}
-          borderColor={theme.border.base}
-        >
-          <Show when={hidden().length > 0} fallback={<text fg={theme.text.muted}>暂无已收起的旁路标签</text>}>
-            <For each={hidden()}>
-              {(item) => (
-                <box flexDirection="row" height={1} flexShrink={0} justifyContent="space-between" alignItems="center">
-                  <text fg={theme.text.base} wrapMode="none" truncate selectable={false}>
-                    {tabLabel(item)}
-                  </text>
-                  <GuiButton
-                    context={context}
-                    label="恢复标签"
-                    icon="↺"
-                    variant="secondary"
-                    onActivateHost={props.input.focus}
-                    onClick={() => void restore(item)}
-                  />
-                </box>
-              )}
-            </For>
-          </Show>
-        </box>
-      </Show>
-
-      {/* Layer 2: Highlighted GUI Toolbar (no ASCII brackets) */}
+      {/* Layer 2: Compact GUI Toolbar */}
       <box
         height={1}
         flexShrink={0}
@@ -900,6 +1220,32 @@ export function SessionPanel(props: SessionPanelProps) {
         gap={1}
       >
         <box flexDirection="row" gap={1} flexShrink={0} alignItems="center">
+          <Show when={creation()}>
+            <GuiButton
+              context={context}
+              label="/btw 分身"
+              variant="ghost"
+              active={creation()?.kind === "btw"}
+              onActivateHost={props.input.focus}
+              onClick={() => openInlineComposer(context, props.updateMemory, rootSessionID(), "btw")}
+            />
+            <GuiButton
+              context={context}
+              label="/sub 专家"
+              variant="ghost"
+              active={creation()?.kind === "sub"}
+              onActivateHost={props.input.focus}
+              onClick={() =>
+                openInlineComposer(
+                  context,
+                  props.updateMemory,
+                  rootSessionID(),
+                  "sub",
+                  agents()[0]?.id ?? "explore",
+                )
+              }
+            />
+          </Show>
           <Show when={!creation() && selected() && selected()?.kind !== "subagent"}>
             <GuiButton
               context={context}
@@ -914,7 +1260,6 @@ export function SessionPanel(props: SessionPanelProps) {
             <GuiButton
               context={context}
               label="送回主线"
-              shortcut="↵"
               variant="secondary"
               onActivateHost={props.input.focus}
               onClick={(shift) => void handoff(shift ? "wake" : "park")}
@@ -935,15 +1280,14 @@ export function SessionPanel(props: SessionPanelProps) {
             <GuiButton
               context={context}
               label="原生视图"
-              shortcut="↗"
               variant="ghost"
               onActivateHost={props.input.focus}
-              onClick={openNative}
+              onClick={() => openNativeSession(selectedID())}
             />
           </Show>
           <GuiButton
             context={context}
-            label={props.input.presentation === "fullscreen" ? "退出全屏" : "全屏"}
+            label={props.input.presentation === "fullscreen" ? "分屏" : "全屏"}
             icon={props.input.presentation === "fullscreen" ? "❐" : "⤢"}
             variant="ghost"
             onActivateHost={props.input.focus}
@@ -963,7 +1307,7 @@ export function SessionPanel(props: SessionPanelProps) {
         </box>
       </box>
 
-      {/* Layer 3: Streaming Markdown Transcript with host-matched ScrollAcceleration & click-to-focus */}
+      {/* Layer 3: Native-aligned Timeline Viewport */}
       <box flexGrow={1} flexBasis={0} minHeight={0} position="relative">
         <scrollbox
           ref={(box: ScrollBoxRenderable) => {
@@ -1008,23 +1352,25 @@ export function SessionPanel(props: SessionPanelProps) {
             <Show
               when={!creation() && selectedID()}
               fallback={
-                <box padding={2}>
-                  <text fg={theme.text.muted} selectable={false}>
-                    {creation()
-                      ? `在下方输入框输入内容，立即开启新的 /${creation()?.kind} 旁路对话。`
-                      : "使用 /btw、/sub 或点击右上角 +btw / ✦sub 创建旁路会话。"}
-                  </text>
-                </box>
+                <Show when={!creation()}>
+                  <box padding={2}>
+                    <text fg={theme.text.muted} selectable={false}>
+                      输入 /btw、/sub 或点右上角 + 开启旁路会话
+                    </text>
+                  </box>
+                </Show>
               }
             >
               <Show
                 when={rows().length > 0}
                 fallback={
-                  <box padding={2}>
-                    <text fg={theme.text.muted} selectable={false}>
-                      {running() ? "● 正在流式生成中…" : "暂无消息，点击下方输入框直接追问。"}
-                    </text>
-                  </box>
+                  <Show when={running()}>
+                    <box padding={2}>
+                      <text fg={theme.text.muted} selectable={false}>
+                        ● 正在思考中…
+                      </text>
+                    </box>
+                  </Show>
                 }
               >
                 <For each={rows()}>
@@ -1033,13 +1379,14 @@ export function SessionPanel(props: SessionPanelProps) {
                       context={context}
                       row={row}
                       theme={theme}
+                      newDesigns={scrollConfig.newDesigns}
                       accent={currentAccent()}
                       syntaxStyle={syntaxStyle()}
-                      expanded={expandedReasoning().has(row.id)}
+                      expanded={expandedRows().has(row.id)}
                       copied={copiedID() === row.id}
                       onActivateHost={props.input.focus}
                       onToggle={() =>
-                        setExpandedReasoning((current) => {
+                        setExpandedRows((current) => {
                           const next = new Set(current)
                           if (next.has(row.id)) next.delete(row.id)
                           else next.add(row.id)
@@ -1074,15 +1421,15 @@ export function SessionPanel(props: SessionPanelProps) {
         </Show>
       </box>
 
-      {/* Layer 4: Graphical OpenCode-native Prompt Card with focus indicator & GUI buttons */}
+      {/* Layer 4: Clean Graphical Prompt Card */}
       <Show
         when={composerKey() !== "none"}
         fallback={
-          <box height={3} flexDirection="row" alignItems="center" justifyContent="center" gap={2} paddingBottom={1}>
+          <box height={2} flexDirection="row" alignItems="center" justifyContent="center" gap={2} paddingBottom={1}>
             <GuiButton
               context={context}
               icon="+"
-              label="新建 /btw 平行分身"
+              label="新建 /btw"
               variant="primary"
               onActivateHost={props.input.focus}
               onClick={() => openInlineComposer(context, props.updateMemory, rootSessionID(), "btw")}
@@ -1090,7 +1437,7 @@ export function SessionPanel(props: SessionPanelProps) {
             <GuiButton
               context={context}
               icon="✦"
-              label="直派 /sub 专家"
+              label="派遣 /sub"
               variant="secondary"
               onActivateHost={props.input.focus}
               onClick={() =>
@@ -1106,7 +1453,7 @@ export function SessionPanel(props: SessionPanelProps) {
           </box>
         }
       >
-        <box paddingLeft={1} paddingRight={1} paddingBottom={1} flexShrink={0}>
+        <box paddingLeft={1} paddingRight={1} flexShrink={0}>
           <GraphicalPromptCard
             context={context}
             syntaxStyle={syntaxStyle()}
@@ -1114,12 +1461,12 @@ export function SessionPanel(props: SessionPanelProps) {
             initialValue={readDraft(props.memory.drafts, composerKey())}
             placeholder={
               creation()?.kind === "sub"
-                ? "给专家派遣一个独立调查或审查任务…"
+                ? "输入独立子代理任务…"
                 : creation()?.kind === "btw"
-                  ? "问一个继承当前上下文但不污染主线的问题…"
+                  ? "问一个旁路问题…"
                   : running()
-                    ? "输入内容实时插队纠偏（Steer）…"
-                    : "继续追问当前会话…"
+                    ? "实时插队纠偏…"
+                    : "追问…"
             }
             agentLabel={titlecaseAgent(currentAgentID())}
             agentAccent={currentAccent()}
@@ -1128,7 +1475,6 @@ export function SessionPanel(props: SessionPanelProps) {
             variantLabel={currentModelDisplay().variant}
             statusLabel={running() ? "运行中 ●" : undefined}
             running={running()}
-            footerHint={footerHint()}
             onActivateHost={props.input.focus}
             inputRef={(area) => {
               composer = area
@@ -1167,8 +1513,8 @@ export function SessionPanel(props: SessionPanelProps) {
                   focusedBackgroundColor="transparent"
                   textColor={theme.text.muted}
                   focusedTextColor={theme.text.base}
-                  selectedBackgroundColor={theme.background.action.primary.selected}
-                  selectedTextColor={theme.text.action.primary.selected}
+                  selectedBackgroundColor={theme.hue.interactive[700]}
+                  selectedTextColor={theme.text.base}
                   options={agents().map((agent) => ({
                     name: `@${agent.id}`,
                     description: "",
@@ -1189,7 +1535,6 @@ export function SessionPanel(props: SessionPanelProps) {
                   <GuiButton
                     context={context}
                     label="中断"
-                    shortcut="ctrl+x"
                     variant="warning"
                     onActivateHost={props.input.focus}
                     onClick={() => void interrupt()}
@@ -1198,7 +1543,6 @@ export function SessionPanel(props: SessionPanelProps) {
                 <GuiButton
                   context={context}
                   label={running() ? "纠偏" : creation() ? "创建" : "发送"}
-                  shortcut="↵"
                   variant="primary"
                   onActivateHost={props.input.focus}
                   onClick={(shift) => void submitComposer(shift)}
@@ -1216,6 +1560,18 @@ export function SessionPanel(props: SessionPanelProps) {
             onEscape={escape}
           />
         </box>
+      </Show>
+
+      <Show when={contextMenu()}>
+        {(menu) => (
+          <PopupContextMenu
+            context={context}
+            x={menu().x}
+            y={menu().y}
+            items={buildContextMenuItems(menu())}
+            onClose={() => setContextMenu(undefined)}
+          />
+        )}
       </Show>
     </box>
   )

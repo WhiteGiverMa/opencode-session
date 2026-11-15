@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test"
 import type { HubItem } from "../src/contract.ts"
 import {
+  adaptiveAsideTabLayout,
   clampScrollOffset,
+  collapseShellPreview,
   defaultSubagent,
   formatFooterBadge,
   formatMessageRows,
@@ -248,5 +250,31 @@ describe("footer status", () => {
     expect(formatFooterBadge(items, new Set())).toBe("◈ 2 btw")
     expect(formatFooterBadge(items, new Set(["b"]))).toBe("◈ 2 btw ●")
     expect(formatFooterBadge([], new Set())).toBe("")
+  })
+})
+
+describe("adaptive tab layout and shell preview collapsing", () => {
+  it("distributes widths adaptively and reports overflow windows when crowded", () => {
+    const tabs = [hub("t1"), hub("t2"), hub("t3"), hub("t4"), hub("t5"), hub("t6")]
+    const roomy = adaptiveAsideTabLayout(tabs.slice(0, 2), "t1", 60, 0)
+    expect(roomy.tabs.map((t) => t.sessionID)).toEqual(["t1", "t2"])
+    expect(roomy.before).toBe(0)
+    expect(roomy.after).toBe(0)
+    expect(roomy.widths).toEqual([30, 30])
+
+    const crowded = adaptiveAsideTabLayout(tabs, "t5", 48, 0)
+    expect(crowded.tabs.some((t) => t.sessionID === "t5")).toBe(true)
+    expect(crowded.before).toBeGreaterThan(0)
+    const activeIdx = crowded.tabs.findIndex((t) => t.sessionID === "t5")
+    expect(crowded.widths[activeIdx]!).toBeGreaterThan(crowded.widths[0]!)
+  })
+
+  it("collapses multi-line shell output and counts hidden lines", () => {
+    const longOut = Array.from({ length: 15 }, (_, i) => `line ${i + 1}`).join("\n")
+    const collapsed = collapseShellPreview("$ git log --oneline", longOut, 6, 80)
+    expect(collapsed.commandLine).toBe("$ git log --oneline")
+    expect(collapsed.overflow).toBe(true)
+    expect(collapsed.hiddenLines).toBe(9)
+    expect(collapsed.previewOutput.split("\n")).toHaveLength(6)
   })
 })

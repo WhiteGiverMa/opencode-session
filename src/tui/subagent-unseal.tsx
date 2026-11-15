@@ -1,5 +1,5 @@
 import type { Plugin } from "@opencode/plugin/tui"
-import type { TextareaRenderable } from "@opentui/core"
+import { MouseButton, type MouseEvent, type TextareaRenderable } from "@opentui/core"
 import { createEffect, createMemo, createSignal, onCleanup, Show } from "solid-js"
 import type { Store } from "solid-js/store"
 import { PANEL_NAME } from "../contract.ts"
@@ -17,7 +17,10 @@ import {
 import {
   GraphicalPromptCard,
   GuiButton,
-  resolveAgentAccent,
+  readHostCliScrollConfig,
+  resolveHostAgentAccent,
+  setPointer,
+  SplitBorder,
   titlecaseAgent,
   useHostSyntaxStyle,
 } from "./ui-primitives.tsx"
@@ -30,14 +33,16 @@ export interface SubagentUnsealProps {
 }
 
 /**
- * Restores full graphical OpenCode-style human input above the host's sealed
- * native child footer, isolating keymap mode while focused so the Subagents
- * picker underneath never steals arrow/enter/escape keys.
+ * Slim collapsible composer bar above the sealed native child footer:
+ * - Collapsed by default (1 row) so it never crowds the native Subagents view.
+ * - Click to expand into the full graphical prompt card; click `收起` or press
+ *   `Escape` (when empty) to fold back into the compact 1-row bar.
  */
 export function SubagentUnseal(props: SubagentUnsealProps) {
   const context = props.context
   const theme = context.theme
   const syntaxStyle = useHostSyntaxStyle(context)
+  const cliConfig = readHostCliScrollConfig()
   const current = createMemo(() => context.data.session.get(props.input.sessionID))
   const meta = createMemo(() => readO3pSessionMeta(current()?.metadata))
   const active = createMemo(() => Boolean(current()?.parentID) || meta() !== undefined)
@@ -45,17 +50,37 @@ export function SubagentUnseal(props: SubagentUnsealProps) {
     rootSessionIDFor(current(), () => context.data.session.root(props.input.sessionID)),
   )
   const running = createMemo(() => context.data.session.status(props.input.sessionID) === "running")
+  const hasDraft = createMemo(() => readDraft(props.memory.drafts, props.input.sessionID).trim().length > 0)
+  const [expanded, setExpanded] = createSignal(false)
+  const [barHovered, setBarHovered] = createSignal(false)
   const [editorFocused, setEditorFocused] = createSignal(false)
   let textarea: TextareaRenderable | undefined
 
-  // While the user is typing in this unsealed prompt card, push a dedicated
-  // keymap mode over the native "composer" mode so SubagentsTab arrow/enter
-  // bindings yield cleanly to the textarea.
+  onCleanup(() => {
+    if (barHovered()) setPointer(context, "default")
+  })
+
   createEffect(() => {
-    if (!active() || !editorFocused()) return
+    if (!active() || !expanded() || !editorFocused()) return
     const release = context.keymap.mode.push("o3p-unseal")
     onCleanup(release)
   })
+
+  const expandAndFocus = (): void => {
+    setExpanded(true)
+    queueMicrotask(() => {
+      if (textarea && !textarea.isDestroyed) {
+        textarea.focus()
+        context.renderer.requestRender()
+      }
+    })
+  }
+
+  const collapseBar = (): void => {
+    textarea?.blur()
+    setEditorFocused(false)
+    setExpanded(false)
+  }
 
   const returnToSplit = (): void => {
     const root = rootSessionID()
@@ -104,79 +129,159 @@ export function SubagentUnseal(props: SubagentUnsealProps) {
   }
 
   const agentID = createMemo(() => current()?.agent ?? "subagent")
-  const accent = createMemo(() => resolveAgentAccent(theme, agentID()))
+  const accent = createMemo(() => resolveHostAgentAccent(context, agentID(), cliConfig.newDesigns))
   const modelMeta = createMemo(() => resolveModelDisplay(context, current()?.model))
+  const isOpen = createMemo(() => expanded() || hasDraft())
 
   return (
     <Show when={active()}>
-      <box flexDirection="column" flexShrink={0} marginBottom={1}>
-        <GraphicalPromptCard
-          context={context}
-          syntaxStyle={syntaxStyle()}
-          valueKey={props.input.sessionID}
-          initialValue={readDraft(props.memory.drafts, props.input.sessionID)}
-          placeholder={
-            running()
-              ? "点击此处直接插队纠偏这个正在运行的子会话…"
-              : "点击此处直接向这个子会话追问或续接任务…"
-          }
-          agentLabel={titlecaseAgent(agentID())}
-          agentAccent={accent()}
-          modelLabel={modelMeta().modelName}
-          providerLabel={modelMeta().providerName}
-          variantLabel={modelMeta().variant}
-          statusLabel={running() ? "运行中 ●" : "已解封 · 空闲"}
-          running={running()}
-          minHeight={1}
-          maxHeight={5}
-          footerHint={
-            editorFocused()
-              ? running()
-                ? "Enter 插队纠偏  ·  Alt+Enter 排队  ·  Ctrl+X 中断  ·  Esc 释放输入框焦点"
-                : "Enter 发送追问  ·  Shift+Enter 换行  ·  Esc 释放输入框焦点"
-              : "鼠标点击输入框即可直接对话  ·  右侧按钮一键返回主会话分屏"
-          }
-          inputRef={(area) => {
-            textarea = area
-          }}
-          onFocusChange={setEditorFocused}
-          actions={
-            <>
-              <GuiButton
-                context={context}
-                icon="←"
-                label="返回主会话分屏"
-                variant="secondary"
-                onClick={() => returnToSplit()}
-              />
+      <Show
+        when={isOpen()}
+        fallback={
+          <box
+            height={1}
+            width="100%"
+            flexShrink={0}
+            flexDirection="row"
+            alignItems="center"
+            justifyContent="space-between"
+            marginBottom={1}
+            border={["left"]}
+            borderColor={barHovered() ? accent() : theme.border.base}
+            customBorderChars={SplitBorder.customBorderChars}
+            backgroundColor={
+              barHovered() ? theme.background.raised.high : theme.decrease(theme.background.raised.base)
+            }
+            paddingLeft={2}
+            paddingRight={1}
+          >
+            <box
+              height={1}
+              flexGrow={1}
+              minWidth={0}
+              flexDirection="row"
+              alignItems="center"
+              gap={1}
+              onMouseOver={() => {
+                setBarHovered(true)
+                setPointer(context, "text")
+              }}
+              onMouseOut={() => {
+                setBarHovered(false)
+                setPointer(context, "default")
+              }}
+              onMouseDown={(event: MouseEvent) => {
+                if (event.button !== MouseButton.LEFT) return
+                event.stopPropagation()
+                expandAndFocus()
+              }}
+            >
+              <text fg={accent()} wrapMode="none" flexShrink={0} selectable={false}>
+                {titlecaseAgent(agentID())}
+              </text>
+              <text
+                fg={barHovered() ? theme.text.base : theme.text.muted}
+                wrapMode="none"
+                truncate
+                flexGrow={1}
+                minWidth={0}
+                selectable={false}
+              >
+                {running() ? "· 点击展开并插队纠偏…" : "· 点击展开向子会话追问…"}
+              </text>
+            </box>
+
+            <box flexDirection="row" gap={1} flexShrink={0} alignItems="center">
               <Show when={running()}>
                 <GuiButton
                   context={context}
                   label="中断"
-                  shortcut="ctrl+x"
                   variant="warning"
                   onClick={() => void interrupt()}
                 />
               </Show>
               <GuiButton
                 context={context}
-                label={running() ? "纠偏" : "发送"}
-                shortcut="↵"
-                variant="primary"
-                onClick={(shift) => void submit(shift)}
+                icon="←"
+                label="返回分屏"
+                variant="ghost"
+                onClick={() => returnToSplit()}
               />
-            </>
-          }
-          onDraftChange={(value) => {
-            props.updateMemory((draft) => {
-              draft.drafts = writeDraft(draft.drafts, props.input.sessionID, value)
-            })
-          }}
-          onSubmit={(queue) => void submit(queue)}
-          onInterrupt={() => void interrupt()}
-          onEscape={() => textarea?.blur()}
-        />
-      </box>
+            </box>
+          </box>
+        }
+      >
+        <box flexDirection="column" flexShrink={0} marginBottom={1}>
+          <GraphicalPromptCard
+            context={context}
+            syntaxStyle={syntaxStyle()}
+            valueKey={props.input.sessionID}
+            initialValue={readDraft(props.memory.drafts, props.input.sessionID)}
+            placeholder={running() ? "实时插队纠偏…" : "追问…"}
+            agentLabel={titlecaseAgent(agentID())}
+            agentAccent={accent()}
+            modelLabel={modelMeta().modelName}
+            providerLabel={modelMeta().providerName}
+            variantLabel={modelMeta().variant}
+            statusLabel={running() ? "运行中 ●" : undefined}
+            running={running()}
+            minHeight={1}
+            maxHeight={5}
+            inputRef={(area) => {
+              textarea = area
+              if (area && expanded()) {
+                queueMicrotask(() => {
+                  if (!area.isDestroyed) area.focus()
+                })
+              }
+            }}
+            onFocusChange={setEditorFocused}
+            actions={
+              <>
+                <GuiButton
+                  context={context}
+                  label="收起"
+                  icon="▾"
+                  variant="ghost"
+                  onClick={() => collapseBar()}
+                />
+                <GuiButton
+                  context={context}
+                  icon="←"
+                  label="返回分屏"
+                  variant="ghost"
+                  onClick={() => returnToSplit()}
+                />
+                <Show when={running()}>
+                  <GuiButton
+                    context={context}
+                    label="中断"
+                    variant="warning"
+                    onClick={() => void interrupt()}
+                  />
+                </Show>
+                <GuiButton
+                  context={context}
+                  label={running() ? "纠偏" : "发送"}
+                  variant="primary"
+                  onClick={(shift) => void submit(shift)}
+                />
+              </>
+            }
+            onDraftChange={(value) => {
+              props.updateMemory((draft) => {
+                draft.drafts = writeDraft(draft.drafts, props.input.sessionID, value)
+              })
+            }}
+            onSubmit={(queue) => void submit(queue)}
+            onInterrupt={() => void interrupt()}
+            onEscape={() => {
+              if (!textarea?.plainText.trim()) collapseBar()
+              else textarea?.blur()
+            }}
+          />
+        </box>
+      </Show>
     </Show>
   )
 }

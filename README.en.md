@@ -12,13 +12,13 @@ Unified session collaboration plugin (`o3p.session`) for OpenCode v2: upgrades `
   - Starts with a workspace read-only lock (`write`/`edit` removed while keeping `read`/`grep`/`glob`/`shell` for inspection), with a one-click unlock toggle in the panel header.
 - **`/sub` Direct Spawning & Full-Tree TUI Console**:
   - Run `/sub [@agent] [task]` to spawn a fresh specialist session directly into the right split pane without spending a main-session turn.
-  - Built on `session.panel` with native mouse drag-to-resize, split/fullscreen toggle, full-tree tab strip (including depth > 1 descendants), `[▾ History]` non-destructive tab drawer, smart stick-to-bottom streaming viewport, and per-session draft persistence.
-  - Clicking `[Native View ↗]` opens the full native session route for heavy diffs while injecting an unsealed composer via `session.composer.top` so child sessions can be steered or resumed directly.
+  - Built on `session.panel` with native mouse drag-to-resize, split/fullscreen toggle, adaptive full-tree tab strip with right-click context menu (rename, copy ID, reopen closed tabs), expandable `$ shell` & `+ Thought` timeline blocks, smart stick-to-bottom streaming viewport, and graphical prompt cards with per-session draft persistence.
+  - Clicking `Native View` opens the full native session route for heavy diffs while injecting a slim 1-row collapsible composer via `session.composer.top` so child sessions can be steered or resumed on demand without crowding the view.
   - Two-tier **Handoff** sends conclusions back to the main session either along-with-next-turn (`park`, default) or with immediate wake (`wake`).
 - **Code Mode `tools.session.*` Namespace**:
   - Core primitives use `pinned: true` so their TypeScript signatures appear inline in the `# Code Mode` catalog without requiring a discovery round-trip.
   - **Inspection**: `list`, `info`, `read` (positive/negative `offset` and `limit` slicing, plus `includeTools` and `includeReasoning` switches), and literal `search`.
-  - **Lifecycle & Messaging**: `create`, `peers`, `send` (transmits only the explicit `message` string with zero implicit transcript leakage; supports `wake` vs `park` delivery and automatic downgrade to `park` after `maxWakeHops = 3`), `watch`, `unwatch`, and `wait`.
+  - **Lifecycle & Messaging**: `create` (stages a valid `ses_...` ID in memory and materializes into the store only upon its first `send`), `peers`, `send` (supports sending to existing/staged IDs or inline `create: { agent, title }`; transmits only the explicit `message` string with zero implicit transcript leakage; supports `wake` vs `park` delivery and automatic downgrade to `park` after `maxWakeHops = 3`), `watch`, `unwatch`, and `wait`.
 
 ## Installation & Build
 
