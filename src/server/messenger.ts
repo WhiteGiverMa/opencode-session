@@ -99,9 +99,12 @@ export function createSessionMessenger(host: SessionMessengerHost): SessionMesse
   const deliverSessionMessage = async (
     input: DeliverSessionMessageInput,
   ): Promise<DeliverSessionMessageResult> => {
+    const materializedTarget = await host.hub.materializeStagedSession(input.toSessionID, input.message)
     const [sender, target] = await Promise.all([
       host.session.get({ sessionID: input.fromSessionID }).catch(() => null),
-      host.session.get({ sessionID: input.toSessionID }).catch(() => null),
+      materializedTarget
+        ? Promise.resolve(materializedTarget)
+        : host.session.get({ sessionID: input.toSessionID }).catch(() => null),
     ])
 
     const senderMeta = sender ? parseSessionMeta(sender.metadata) : await host.hub.getSessionMeta(input.fromSessionID)

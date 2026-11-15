@@ -1229,4 +1229,57 @@ describe("opencode-session server plugin", () => {
     expect(cleanup).toBeUndefined()
     expect(disabledMock.registeredTools.has("session_send")).toBe(false)
   })
+
+  test("tools.session.create stages ID without persisting empty session until first send, and send({ create }) spawns inline", async () => {
+    const mock = createMockHarness()
+    mock.sessions.set("ses_root", makeSessionInfo({ id: "ses_root", title: "Root", agent: "meidocho" }))
+    await createSessionServer(mock.ctx, { reader: createMockReader() })
+
+    // 1. Staged create: returns valid ses_... ID, but mock.sessions does NOT contain it yet!
+    const staged = (await mock.invokeTool(
+      "create",
+      { agent: "explore", title: "Lazy Explore", readonly: true },
+      "ses_root",
+    )) as { output: { sessionID: string; staged: boolean; readonly: boolean } }
+
+    expect(staged.output.sessionID.startsWith("ses_")).toBe(true)
+    expect(staged.output.staged).toBe(true)
+    expect(staged.output.readonly).toBe(true)
+    expect(mock.sessions.has(staged.output.sessionID)).toBe(false)
+
+    // Watch can already subscribe to the staged ID before it is materialized
+    await mock.invokeTool(
+      "watch",
+      { target: staged.output.sessionID, once: true, delivery: "park" },
+      "ses_root",
+    )
+    expect(mock.sessions.has(staged.output.sessionID)).toBe(false)
+
+    // First send materializes the session with the exact staged ID, sets readonly, and prompts it
+    const sent = (await mock.invokeTool(
+      "send",
+      { to: staged.output.sessionID, message: "Start lazy task", delivery: "wake" },
+      "ses_root",
+    )) as { output: { toSessionID: string; method: string } }
+
+    expect(sent.output.toSessionID).toBe(staged.output.sessionID)
+    expect(sent.output.method).toBe("prompt")
+    expect(mock.sessions.has(staged.output.sessionID)).toBe(true)
+    expect(mock.sessions.get(staged.output.sessionID)?.agent).toBe("explore")
+    expect(
+      (mock.sessions.get(staged.output.sessionID)?.metadata?.[META_KEY_SESSION] as { readonly: boolean })?.readonly,
+    ).toBe(true)
+
+    // 2. One-step inline send({ create: { ... }, message }) without calling create first
+    const inlineSent = (await mock.invokeTool(
+      "send",
+      { create: { agent: "oracle" }, message: "Review auth design", delivery: "wake" },
+      "ses_root",
+    )) as { output: { toSessionID: string; method: string } }
+
+    expect(inlineSent.output.toSessionID.startsWith("ses_")).toBe(true)
+    expect(inlineSent.output.method).toBe("prompt")
+    expect(mock.sessions.get(inlineSent.output.toSessionID)?.agent).toBe("oracle")
+    expect(mock.sessions.get(inlineSent.output.toSessionID)?.title).toBe("Review auth design")
+  })
 })

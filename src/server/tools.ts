@@ -65,8 +65,17 @@ const PeersOutputSchema = Schema.Struct({
   peers: Schema.Array(PeerItemSchema),
 })
 
+const InlineCreateSpecSchema = Schema.Struct({
+  agent: Schema.optional(Schema.String),
+  model: Schema.optional(ModelRefSchema),
+  title: Schema.optional(Schema.String),
+  parentID: Schema.optional(Schema.NullOr(Schema.String)),
+  readonly: Schema.optional(Schema.Boolean),
+})
+
 const SendInputSchema = Schema.Struct({
-  to: Schema.String,
+  to: Schema.optional(Schema.String),
+  create: Schema.optional(InlineCreateSpecSchema),
   message: Schema.String,
   delivery: Schema.optional(DeliveryMode),
 })
@@ -140,6 +149,7 @@ const CreateInputSchema = Schema.Struct({
   title: Schema.optional(Schema.String),
   parentID: Schema.optional(Schema.NullOr(Schema.String)),
   readonly: Schema.optional(Schema.Boolean),
+  immediate: Schema.optional(Schema.Boolean),
 })
 
 const CreateOutputSchema = Schema.Struct({
@@ -149,6 +159,7 @@ const CreateOutputSchema = Schema.Struct({
   agent: Schema.NullOr(Schema.String),
   model: Schema.NullOr(ModelRefSchema),
   readonly: Schema.Boolean,
+  staged: Schema.Boolean,
 })
 
 const WatchInputSchema = Schema.Struct({
@@ -438,12 +449,27 @@ export async function registerSessionTools(options: RegisterSessionToolsOptions)
     editor.add({
       name: "send",
       description:
-        "Send a one-way message envelope to another session (by sessionID or alias) with explicit delivery: 'wake' (triggers/steers a turn immediately; auto-downgrades to 'park' past maxWakeHops) or 'park' (queues silently without interrupting). Transmits ONLY the explicit message string.",
+        "Send a one-way message envelope to an existing/staged session (`to`: sessionID or alias) or spawn on the fly (`create`: { agent, title, ... }), with delivery 'wake' (default) or 'park'. Transmits ONLY the explicit message string.",
       input: SendInputSchema,
       output: SendOutputSchema,
       options: { namespace: "session", codemode: true, pinned: true },
       execute: async (input, context) => {
-        const toSessionID = await hub.resolveTargetSessionID(context.sessionID, input.to)
+        let toSessionID: string
+        if (input.to !== undefined && input.to.trim().length > 0) {
+          toSessionID = await hub.resolveTargetSessionID(context.sessionID, input.to)
+        } else if (input.create !== undefined) {
+          const parentID = input.create.parentID === undefined ? context.sessionID : input.create.parentID
+          const staged = hub.stageSession({
+            parentID,
+            agent: input.create.agent ?? null,
+            model: input.create.model ?? null,
+            title: input.create.title ?? null,
+            readonly: input.create.readonly === true,
+          })
+          toSessionID = staged.sessionID
+        } else {
+          throw new Error("tools.session.send requires either `to` (target sessionID/alias) or `create` (new session spec)")
+        }
         const result = await messenger.deliverSessionMessage({
           fromSessionID: context.sessionID,
           toSessionID,
@@ -483,12 +509,34 @@ export async function registerSessionTools(options: RegisterSessionToolsOptions)
     editor.add({
       name: "create",
       description:
-        "Create a new session (child/subagent under current session by default, or standalone if parentID is null). Combine with tools.session.send and tools.session.watch/wait for parallel delegation.",
+        "Stage a new session ID in memory (materialized into the session store only upon its first tools.session.send, matching TUI new-session behavior; pass immediate=true to persist empty immediately).",
       input: CreateInputSchema,
       output: CreateOutputSchema,
       options: { namespace: "session", codemode: true, pinned: true },
       execute: async (input, context) => {
         const parentID = input.parentID === undefined ? context.sessionID : input.parentID
+        if (input.immediate !== true) {
+          const staged = hub.stageSession({
+            parentID,
+            agent: input.agent ?? null,
+            model: input.model ?? null,
+            title: input.title ?? null,
+            readonly: input.readonly === true,
+          })
+          return {
+            output: {
+              sessionID: staged.sessionID,
+              parentID: staged.parentID,
+              title: staged.title ?? staged.sessionID,
+              agent: staged.agent,
+              model: staged.model,
+              readonly: staged.readonly,
+              staged: true,
+            },
+            content: `Staged session ${staged.sessionID}${staged.agent ? ` (agent=${staged.agent})` : ""}; will materialize on first send.`,
+          }
+        }
+
         const created = await sessionApi.create({
           parentID,
           agent: input.agent ?? null,
@@ -517,6 +565,7 @@ export async function registerSessionTools(options: RegisterSessionToolsOptions)
                 }
               : null,
             readonly,
+            staged: false,
           },
           content: `Created session ${created.id}${created.agent ? ` (agent=${created.agent})` : ""}.`,
         }

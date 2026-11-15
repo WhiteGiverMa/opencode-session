@@ -9,6 +9,7 @@ import {
   type HubItemKind,
   META_KEY_HUB,
   META_KEY_SESSION,
+  type ModelRefInfo,
   type O3pSessionHubMeta,
   O3pSessionHubMetaSchema,
   type O3pSessionMeta,
@@ -50,6 +51,24 @@ export interface RemoveWatchInput {
   readonly targetID: string
 }
 
+export interface StagedSessionSpec {
+  readonly sessionID: string
+  readonly parentID: string | null
+  readonly agent: string | null
+  readonly model: ModelRefInfo | null
+  readonly title: string | null
+  readonly readonly: boolean
+  readonly createdAt: number
+}
+
+export interface StageSessionInput {
+  readonly parentID: string | null
+  readonly agent?: string | null
+  readonly model?: ModelRefInfo | null
+  readonly title?: string | null
+  readonly readonly?: boolean
+}
+
 export interface SessionHub {
   registerAside(input: RegisterAsideInput): Promise<{ meta: O3pSessionMeta }>
   setReadonly(input: { sessionID: string; readonly: boolean }): Promise<{ readonly: boolean }>
@@ -63,6 +82,9 @@ export interface SessionHub {
   getCachedMeta(sessionID: string): O3pSessionMeta | null | undefined
   getWakeHop(sessionID: string): number
   setWakeHop(sessionID: string, hop: number): void
+  stageSession(input: StageSessionInput): StagedSessionSpec
+  getStagedSession(sessionID: string): StagedSessionSpec | undefined
+  materializeStagedSession(sessionID: string, fallbackTitle?: string): Promise<SessionInfo | null>
   markNewlyCreatedEmptySession(sessionID: string): void
   clearNewlyCreatedEmptySession(sessionID: string): void
   isNewlyCreatedEmptySession(sessionID: string): boolean
@@ -139,6 +161,28 @@ function sanitizeAliasPrefix(raw: string): string {
   return cleaned.length > 0 ? cleaned : "subagent"
 }
 
+const ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+let lastMintTimestamp = 0
+let mintCounter = 0
+
+/** Mints a canonical descending `ses_...` ID matching `@opencode/schema/identifier`. */
+export function mintSessionID(timestamp = Date.now()): string {
+  if (timestamp !== lastMintTimestamp) {
+    lastMintTimestamp = timestamp
+    mintCounter = 0
+  }
+  mintCounter += 1
+  const current = BigInt(timestamp) * 0x1000n + BigInt(mintCounter)
+  const inverted = ~current
+  const timeHex = Array.from({ length: 6 }, (_, index) =>
+    Number((inverted >> BigInt(40 - 8 * index)) & 0xffn)
+      .toString(16)
+      .padStart(2, "0"),
+  ).join("")
+  const randomBytes = crypto.getRandomValues(new Uint8Array(14))
+  return `ses_${timeHex}${Array.from(randomBytes, (b) => ID_CHARS[b % 62]).join("")}`
+}
+
 export function isSessionIdle(session: SessionInfo): boolean {
   if (session.time.busy === undefined) return true
   return session.time.idle !== undefined && session.time.idle >= session.time.busy
@@ -154,8 +198,60 @@ export function createSessionHub(host: SessionHubHost): SessionHub {
   const wakeHops = new Map<string, number>()
   const humanTouchedIdleSubagents = new Set<string>()
   const newlyCreatedEmptySessions = new Set<string>()
+  const stagedSessions = new Map<string, StagedSessionSpec>()
+  const materializingSessions = new Map<string, Promise<SessionInfo>>()
   const watchesByTarget = new Map<string, Map<string, WatchRecord>>()
   let hydrated = false
+
+  const stageSession = (input: StageSessionInput): StagedSessionSpec => {
+    const spec: StagedSessionSpec = {
+      sessionID: mintSessionID(),
+      parentID: input.parentID,
+      agent: input.agent ?? null,
+      model: input.model ?? null,
+      title: input.title ?? null,
+      readonly: input.readonly === true,
+      createdAt: Date.now(),
+    }
+    stagedSessions.set(spec.sessionID, spec)
+    return spec
+  }
+
+  const materializeStagedSession = async (sessionID: string, fallbackTitle?: string): Promise<SessionInfo | null> => {
+    const inflight = materializingSessions.get(sessionID)
+    if (inflight) return inflight
+    const spec = stagedSessions.get(sessionID)
+    if (!spec) return null
+
+    const run = (async () => {
+      stagedSessions.delete(sessionID)
+      try {
+        const derivedTitle =
+          spec.title ??
+          (fallbackTitle ? fallbackTitle.replace(/\s+/g, " ").trim().slice(0, 60) || null : null)
+        const created = await host.session.create({
+          id: spec.sessionID,
+          parentID: spec.parentID,
+          agent: spec.agent,
+          model: spec.model,
+          title: derivedTitle,
+        })
+        newlyCreatedEmptySessions.add(created.id)
+        if (spec.readonly) {
+          await setReadonly({ sessionID: created.id, readonly: true })
+        }
+        return created
+      } catch (err) {
+        stagedSessions.set(sessionID, spec)
+        throw err
+      } finally {
+        materializingSessions.delete(sessionID)
+      }
+    })()
+
+    materializingSessions.set(sessionID, run)
+    return run
+  }
 
   const indexHubWatches = (watcherID: string, hubMeta: O3pSessionHubMeta): void => {
     for (const [targetID, watchers] of watchesByTarget) {
@@ -536,6 +632,10 @@ export function createSessionHub(host: SessionHubHost): SessionHub {
     const rootSessionID = caller ? await resolveRootSessionID(caller) : callerSessionID
     if (trimmed === "root") return rootSessionID
 
+    if (stagedSessions.has(trimmed) || materializingSessions.has(trimmed)) {
+      return trimmed
+    }
+
     const direct = await host.session.get({ sessionID: trimmed }).catch(() => null)
     if (direct) return direct.id
 
@@ -668,8 +768,8 @@ export function createSessionHub(host: SessionHubHost): SessionHub {
         text: [
           "<o3p-session-os>",
           "Code Mode `tools.session.*` manages child, aside, and peer sessions in one JS `execute` call.",
-          "- Discover nodes with `tools.session.peers({})`, create children via `tools.session.create(...)`, and fan out with `Promise.all`.",
-          "- `tools.session.send({ to, message, delivery })`: `wake` triggers/steers a turn immediately (auto-downgrades to `park` past hop limit); `park` queues silently for next turn.",
+          "- Discover nodes with `tools.session.peers({})`; `tools.session.create(...)` stages an ID in memory (materialized only on first `send`), or pass `create: { agent, title }` directly to `send`.",
+          "- `tools.session.send({ to, create, message, delivery })`: `wake` triggers/steers a turn immediately (auto-downgrades to `park` past hop limit); `park` queues silently for next turn.",
           "- Zero implicit context leakage: `send` transmits ONLY your explicit `message` string; recipients pull transcripts on demand via `tools.session.read`.",
           "- Subscribe to completion via `tools.session.watch({ target, once, delivery })` or block synchronously via `tools.session.wait({ sessionID })`.",
           "</o3p-session-os>",
@@ -739,6 +839,9 @@ export function createSessionHub(host: SessionHubHost): SessionHub {
     setWakeHop: (sessionID: string, hop: number) => {
       wakeHops.set(sessionID, hop)
     },
+    stageSession,
+    getStagedSession: (sessionID: string) => stagedSessions.get(sessionID),
+    materializeStagedSession,
     markNewlyCreatedEmptySession: (sessionID: string) => {
       newlyCreatedEmptySessions.add(sessionID)
     },
@@ -759,6 +862,8 @@ export function createSessionHub(host: SessionHubHost): SessionHub {
       wakeHops.clear()
       humanTouchedIdleSubagents.clear()
       newlyCreatedEmptySessions.clear()
+      stagedSessions.clear()
+      materializingSessions.clear()
       watchesByTarget.clear()
       hydrated = false
     },
