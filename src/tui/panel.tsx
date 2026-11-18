@@ -2,16 +2,16 @@ import type { Plugin } from "@opencode/plugin/tui"
 import {
   MouseButton,
   RGBA,
+  ScrollBoxRenderable,
   TabSelectRenderableEvents,
   TextAttributes,
   type KeyEvent,
   type MouseEvent,
-  type ScrollBoxRenderable,
   type TabSelectOption,
   type TabSelectRenderable,
   type TextareaRenderable,
 } from "@opentui/core"
-import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show, untrack } from "solid-js"
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show, untrack, type JSX } from "solid-js"
 import type { Store } from "solid-js/store"
 import { SessionRpc, type DeliveryMode, type HubItem } from "../contract.ts"
 import {
@@ -65,6 +65,18 @@ import {
 } from "./ui-primitives.tsx"
 
 type Theme = Plugin.Context["theme"]
+
+// The published SDK also runs on hosts without the native transcript patch.
+type NativeTranscriptUI = Plugin.Context["ui"] & {
+  readonly session?: {
+    transcript(input: {
+      readonly sessionID: string
+      readonly width?: number
+      readonly onOpenSession?: (sessionID: string) => void
+      readonly onActivate?: () => void
+    }): JSX.Element
+  }
+}
 
 type PanelInput = {
   readonly name: string
@@ -595,6 +607,8 @@ export function SessionPanel(props: SessionPanelProps) {
   const context = props.context
   const theme = context.theme
   const rpc = context.client.rpc(SessionRpc)
+  const sessionUI = (context.ui as NativeTranscriptUI).session
+  const nativeTranscript = typeof sessionUI?.transcript === "function" ? sessionUI : undefined
   const syntaxStyle = useHostSyntaxStyle(context)
   const scrollConfig = readHostCliScrollConfig()
   const scrollAcceleration = createHostScrollAcceleration(scrollConfig)
@@ -645,38 +659,44 @@ export function SessionPanel(props: SessionPanelProps) {
   }
 
   onMount(() => {
-    const off = rpc.events.on("updated", (event) => {
-      if (event.data.rootSessionID === rootSessionID()) void refresh()
-    })
-    const offEvents = context.data.listen(({ details }) => {
-      const id = selectedID()
-      if (!id) return
-      const applied = applyPanelStreamEvent(untrack(localMessages), details, id)
-      if (applied.next !== untrack(localMessages)) {
-        setLocalMessages(applied.next)
+    onCleanup(
+      rpc.events.on("updated", (event) => {
+        if (event.data.rootSessionID === rootSessionID()) void refresh()
+      }),
+    )
+    if (nativeTranscript) {
+      // Native rows own message hydration and streaming. Only refresh the hub here.
+      const refreshSelected = ({ data }: { data: { sessionID: string } }) => {
+        if (data.sessionID === selectedID()) void refresh()
       }
-      if (applied.shouldRefetch) {
-        void fetchPanelMessages(id)
-      }
-      if (
-        (details.type === "session.idle" ||
-          details.type === "session.step.ended" ||
-          details.type === "session.inbox.enqueued" ||
-          details.type === "session.renamed") &&
-        "sessionID" in details.data &&
-        details.data.sessionID === id
-      ) {
-        context.data.session.invalidate(id)
-        context.data.session.message.invalidate(id)
-        void context.data.session.sync(id).catch(() => undefined)
-        void context.data.session.message.sync(id).catch(() => undefined)
-        void refresh()
-      }
-    })
-    onCleanup(() => {
-      off()
-      offEvents()
-    })
+      onCleanup(context.data.on("session.idle", refreshSelected))
+      onCleanup(context.data.on("session.renamed", refreshSelected))
+      return
+    }
+    onCleanup(
+      context.data.listen(({ details }) => {
+        const id = selectedID()
+        if (!id) return
+        const before = untrack(localMessages)
+        const applied = applyPanelStreamEvent(before, details, id)
+        if (applied.next !== before) setLocalMessages(applied.next)
+        if (applied.shouldRefetch) void fetchPanelMessages(id)
+        if (
+          (details.type === "session.idle" ||
+            details.type === "session.step.ended" ||
+            details.type === "session.inbox.enqueued" ||
+            details.type === "session.renamed") &&
+          "sessionID" in details.data &&
+          details.data.sessionID === id
+        ) {
+          context.data.session.invalidate(id)
+          context.data.session.message.invalidate(id)
+          void context.data.session.sync(id).catch(() => undefined)
+          void context.data.session.message.sync(id).catch(() => undefined)
+          void refresh()
+        }
+      }),
+    )
   })
 
   createEffect(
@@ -712,6 +732,7 @@ export function SessionPanel(props: SessionPanelProps) {
     return id !== undefined && context.data.session.status(id) === "running"
   })
   const messages = createMemo(() => {
+    if (nativeTranscript) return []
     const id = selectedID()
     if (!id) return []
     const host = context.data.session.message.list(id)
@@ -731,11 +752,12 @@ export function SessionPanel(props: SessionPanelProps) {
     queueMicrotask(() => {
       const current = context.renderer.currentFocusedRenderable
       if (current === transcript || current === composer) return
+      if (nativeTranscript && current instanceof ScrollBoxRenderable) return
       if (composer && !composer.isDestroyed) composer.focus()
     })
   })
 
-  const select = (sessionID: string): void => {
+  const selectSession = (sessionID: string): void => {
     setUnread((current) => {
       const next = new Set(current)
       next.delete(sessionID)
@@ -791,6 +813,7 @@ export function SessionPanel(props: SessionPanelProps) {
 
   createEffect(
     on(selectedID, (sessionID, previous) => {
+      if (nativeTranscript) return
       if (previous && previous !== sessionID) saveScroll(previous)
       setExpandedRows(new Set<string>())
       setLocalMessages([])
@@ -840,7 +863,7 @@ export function SessionPanel(props: SessionPanelProps) {
   const hide = async (item: HubItem): Promise<void> => {
     if (selectedID() === item.sessionID) {
       const next = nextTabID(items(), item.sessionID, 1)
-      if (next && next !== item.sessionID) select(next)
+      if (next && next !== item.sessionID) selectSession(next)
       else props.updateMemory((draft) => delete draft.selectedByRoot[rootSessionID()])
     }
     try {
@@ -854,7 +877,7 @@ export function SessionPanel(props: SessionPanelProps) {
     try {
       await rpc.setHidden({ sessionID: item.sessionID, hidden: false }, rpcOptions(context))
       await refresh()
-      select(item.sessionID)
+      selectSession(item.sessionID)
     } catch (error: unknown) {
       context.ui.toast.show({ message: errorMessage(error), variant: "error" })
     }
@@ -1032,8 +1055,14 @@ export function SessionPanel(props: SessionPanelProps) {
       }
       if (!selectedAtSubmit) return
       const isRunning = context.data.session.status(selectedAtSubmit) === "running"
-      await sendSessionPrompt(context, selectedAtSubmit, text, isRunning ? (queue ? "queue" : "steer") : undefined)
-      await fetchPanelMessages(selectedAtSubmit)
+      await sendSessionPrompt(
+        context,
+        selectedAtSubmit,
+        text,
+        isRunning ? (queue ? "queue" : "steer") : undefined,
+        !nativeTranscript,
+      )
+      if (!nativeTranscript) await fetchPanelMessages(selectedAtSubmit)
     } catch (error: unknown) {
       context.ui.toast.show({ message: errorMessage(error), variant: "error" })
       if (composerKey() === key && composer && !composer.isDestroyed && !composer.plainText) {
@@ -1050,20 +1079,20 @@ export function SessionPanel(props: SessionPanelProps) {
     commands: panelKeybindingCommands({
       cycleTab: (delta) => {
         const next = nextTabID(items(), selectedID(), delta)
-        if (next) select(next)
+        if (next) selectSession(next)
       },
       handoff: (delivery) => void handoff(delivery),
       interrupt: () => void interrupt(),
       escape,
       toggleFullscreen: props.input.toggleFullscreen,
-      jumpToLatest,
+      jumpToLatest: nativeTranscript ? undefined : jumpToLatest,
     }),
   }))
 
   context.keymap.layer(() => ({
     mode: "global",
     target: () => transcript,
-    enabled: () => props.input.focused,
+    enabled: () => !nativeTranscript && props.input.focused,
     priority: 21,
     commands: [
       { bind: "up", run: () => scrollBy(-keyboardScrollStep) },
@@ -1130,10 +1159,10 @@ export function SessionPanel(props: SessionPanelProps) {
           const dir = event.scroll?.direction
           if (dir === "up" || dir === "left") {
             const prev = nextTabID(items(), selectedID(), -1)
-            if (prev) select(prev)
+            if (prev) selectSession(prev)
           } else if (dir === "down" || dir === "right") {
             const next = nextTabID(items(), selectedID(), 1)
-            if (next) select(next)
+            if (next) selectSession(next)
           }
         }}
       >
@@ -1148,7 +1177,7 @@ export function SessionPanel(props: SessionPanelProps) {
               onClick={() => {
                 const targetIdx = Math.max(0, tabLayout().start - 1)
                 const item = visible()[targetIdx]
-                if (item) select(item.sessionID)
+                if (item) selectSession(item.sessionID)
               }}
             />
           </Show>
@@ -1164,7 +1193,7 @@ export function SessionPanel(props: SessionPanelProps) {
                 unread={unread().has(item.sessionID)}
                 newDesigns={scrollConfig.newDesigns}
                 onActivateHost={props.input.focus}
-                onSelect={() => select(item.sessionID)}
+                onSelect={() => selectSession(item.sessionID)}
                 onMiddleClose={() => void hide(item)}
                 onRightMenu={(event) => setContextMenu({ x: event.x, y: event.y, item })}
               />
@@ -1181,7 +1210,7 @@ export function SessionPanel(props: SessionPanelProps) {
               onClick={() => {
                 const targetIdx = Math.min(visible().length - 1, tabLayout().start + tabLayout().tabs.length)
                 const item = visible()[targetIdx]
-                if (item) select(item.sessionID)
+                if (item) selectSession(item.sessionID)
               }}
             />
           </Show>
@@ -1308,52 +1337,129 @@ export function SessionPanel(props: SessionPanelProps) {
       </box>
 
       {/* Layer 3: Native-aligned Timeline Viewport */}
-      <box flexGrow={1} flexBasis={0} minHeight={0} position="relative">
-        <scrollbox
-          ref={(box: ScrollBoxRenderable) => {
-            transcript = box
-            const update = () => syncAway()
-            box.verticalScrollBar.on("change", update)
-            removeScrollListener = () => box.verticalScrollBar.off("change", update)
-            queueMicrotask(() => {
-              if (!away()) jumpToLatest()
-            })
-          }}
-          flexGrow={1}
-          minHeight={0}
-          stickyScroll={!away()}
-          stickyStart="bottom"
-          viewportCulling
-          scrollAcceleration={scrollAcceleration}
-          verticalScrollbarOptions={{
-            visible: scrollConfig.scrollbar,
-            trackOptions: {
-              foregroundColor: theme.scrollbar.base,
-              backgroundColor: "transparent",
-            },
-          }}
-          onMouseDown={(event: MouseEvent) => {
-            if (event.button !== MouseButton.LEFT) return
-            props.input.focus()
-            event.stopPropagation()
-            if (!context.renderer.hasSelection) {
-              transcript?.focus()
-            }
-          }}
-          onMouseScroll={(event) => {
-            if (event.scroll?.direction === "up") {
-              setAway(true)
-              if (transcript) transcript.stickyScroll = false
-            }
-            queueMicrotask(syncAway)
-          }}
-        >
-          <box flexDirection="column" width="100%" minHeight={0} paddingBottom={1}>
+      <Show when={!nativeTranscript}>
+        <box flexGrow={1} flexBasis={0} minHeight={0} position="relative">
+          <scrollbox
+            ref={(box: ScrollBoxRenderable) => {
+              transcript = box
+              const update = () => syncAway()
+              box.verticalScrollBar.on("change", update)
+              removeScrollListener = () => box.verticalScrollBar.off("change", update)
+              queueMicrotask(() => {
+                if (!away()) jumpToLatest()
+              })
+            }}
+            flexGrow={1}
+            minHeight={0}
+            stickyScroll={!away()}
+            stickyStart="bottom"
+            viewportCulling
+            scrollAcceleration={scrollAcceleration}
+            verticalScrollbarOptions={{
+              visible: scrollConfig.scrollbar,
+              trackOptions: {
+                foregroundColor: theme.scrollbar.base,
+                backgroundColor: "transparent",
+              },
+            }}
+            onMouseDown={(event: MouseEvent) => {
+              if (event.button !== MouseButton.LEFT) return
+              props.input.focus()
+              event.stopPropagation()
+              if (!context.renderer.hasSelection) {
+                transcript?.focus()
+              }
+            }}
+            onMouseScroll={(event) => {
+              if (event.scroll?.direction === "up") {
+                setAway(true)
+                if (transcript) transcript.stickyScroll = false
+              }
+              queueMicrotask(syncAway)
+            }}
+          >
+            <box flexDirection="column" width="100%" minHeight={0} paddingBottom={1}>
+              <Show
+                when={!creation() && selectedID()}
+                fallback={
+                  <Show when={!creation()}>
+                    <box padding={2}>
+                      <text fg={theme.text.muted} selectable={false}>
+                        输入 /btw、/sub 或点右上角 + 开启旁路会话
+                      </text>
+                    </box>
+                  </Show>
+                }
+              >
+                <Show
+                  when={rows().length > 0}
+                  fallback={
+                    <Show when={running()}>
+                      <box padding={2}>
+                        <text fg={theme.text.muted} selectable={false}>
+                          ● 正在思考中…
+                        </text>
+                      </box>
+                    </Show>
+                  }
+                >
+                  <For each={rows()}>
+                    {(row) => (
+                      <TranscriptRow
+                        context={context}
+                        row={row}
+                        theme={theme}
+                        newDesigns={scrollConfig.newDesigns}
+                        accent={currentAccent()}
+                        syntaxStyle={syntaxStyle()}
+                        expanded={expandedRows().has(row.id)}
+                        copied={copiedID() === row.id}
+                        onActivateHost={props.input.focus}
+                        onToggle={() =>
+                          setExpandedRows((current) => {
+                            const next = new Set(current)
+                            if (next.has(row.id)) next.delete(row.id)
+                            else next.add(row.id)
+                            return next
+                          })
+                        }
+                        onCopy={copy}
+                      />
+                    )}
+                  </For>
+                </Show>
+              </Show>
+              <Show when={hubError()}>
+                <box paddingLeft={2} paddingRight={2}>
+                  <text fg={theme.text.feedback.warning.base} wrapMode="word">{`目录同步失败：${hubError()}`}</text>
+                </box>
+              </Show>
+            </box>
+          </scrollbox>
+
+          <Show when={away()}>
+            <box position="absolute" right={2} bottom={1} zIndex={2}>
+              <GuiButton
+                context={context}
+                icon="↓"
+                label="跳至最新"
+                variant="primary"
+                onActivateHost={props.input.focus}
+                onClick={jumpToLatest}
+              />
+            </box>
+          </Show>
+        </box>
+      </Show>
+      <Show when={nativeTranscript}>
+        {(native) => (
+          <box flexGrow={1} flexBasis={0} minHeight={0} paddingLeft={1} paddingRight={1}>
             <Show
               when={!creation() && selectedID()}
+              keyed
               fallback={
                 <Show when={!creation()}>
-                  <box padding={2}>
+                  <box padding={1} flexGrow={1}>
                     <text fg={theme.text.muted} selectable={false}>
                       输入 /btw、/sub 或点右上角 + 开启旁路会话
                     </text>
@@ -1361,65 +1467,29 @@ export function SessionPanel(props: SessionPanelProps) {
                 </Show>
               }
             >
-              <Show
-                when={rows().length > 0}
-                fallback={
-                  <Show when={running()}>
-                    <box padding={2}>
-                      <text fg={theme.text.muted} selectable={false}>
-                        ● 正在思考中…
-                      </text>
-                    </box>
-                  </Show>
-                }
-              >
-                <For each={rows()}>
-                  {(row) => (
-                    <TranscriptRow
-                      context={context}
-                      row={row}
-                      theme={theme}
-                      newDesigns={scrollConfig.newDesigns}
-                      accent={currentAccent()}
-                      syntaxStyle={syntaxStyle()}
-                      expanded={expandedRows().has(row.id)}
-                      copied={copiedID() === row.id}
-                      onActivateHost={props.input.focus}
-                      onToggle={() =>
-                        setExpandedRows((current) => {
-                          const next = new Set(current)
-                          if (next.has(row.id)) next.delete(row.id)
-                          else next.add(row.id)
-                          return next
-                        })
-                      }
-                      onCopy={copy}
-                    />
-                  )}
-                </For>
-              </Show>
+              {(id) =>
+                native().transcript({
+                  sessionID: id,
+                  get width() {
+                    return Math.max(24, props.input.width - 2)
+                  },
+                  onOpenSession: (targetID) => {
+                    selectSession(targetID)
+                    // A link can arrive before a newly created descendant is listed in the hub.
+                    if (!items().some((item) => item.sessionID === targetID)) void refresh()
+                  },
+                  onActivate: props.input.focus,
+                })
+              }
             </Show>
             <Show when={hubError()}>
-              <box paddingLeft={2} paddingRight={2}>
+              <box paddingLeft={1} paddingRight={1} flexShrink={0}>
                 <text fg={theme.text.feedback.warning.base} wrapMode="word">{`目录同步失败：${hubError()}`}</text>
               </box>
             </Show>
           </box>
-        </scrollbox>
-
-        <Show when={away()}>
-          <box position="absolute" right={2} bottom={1} zIndex={2}>
-            <GuiButton
-              context={context}
-              icon="↓"
-              label="跳至最新"
-              variant="primary"
-              onActivateHost={props.input.focus}
-              onClick={jumpToLatest}
-            />
-          </box>
-        </Show>
-      </box>
+        )}
+      </Show>
 
       {/* Layer 4: Clean Graphical Prompt Card */}
       <Show

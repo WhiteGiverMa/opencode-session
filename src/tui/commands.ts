@@ -63,12 +63,16 @@ export async function sendSessionPrompt(
   sessionID: string,
   text: string,
   delivery?: "steer" | "queue",
+  syncMessages = true,
 ): Promise<void> {
   await context.client.session.prompt({
     sessionID,
     text,
     ...(delivery ? { delivery } : {}),
   })
+  // Native transcripts already follow the event stream. A snapshot taken at admission can
+  // replace an in-flight turn before its remaining steps have been projected.
+  if (!syncMessages) return
   context.data.session.message.invalidate(sessionID)
   await context.data.session.message.sync(sessionID)
 }
@@ -185,7 +189,7 @@ export interface PanelKeyActions {
   readonly interrupt: () => void
   readonly escape: () => void
   readonly toggleFullscreen: () => void
-  readonly jumpToLatest: () => void
+  readonly jumpToLatest?: () => void
 }
 
 /** Non-text keys are safe while the mini composer is focused. */
@@ -197,7 +201,9 @@ export function panelKeybindingCommands(actions: PanelKeyActions): readonly Pane
     { bind: "ctrl+shift+h", title: "Wake root with latest answer", group: "Session", run: () => actions.handoff("wake") },
     { bind: "ctrl+x", title: "Interrupt aside", group: "Session", run: actions.interrupt },
     { bind: "ctrl+shift+f", title: "Toggle aside fullscreen", group: "Session", run: actions.toggleFullscreen },
-    { bind: "ctrl+end", title: "Jump to latest aside output", group: "Session", run: actions.jumpToLatest },
+    ...(actions.jumpToLatest
+      ? [{ bind: "ctrl+end", title: "Jump to latest aside output", group: "Session", run: actions.jumpToLatest }]
+      : []),
     { bind: "escape", title: "Return focus without closing the aside", group: "Session", run: actions.escape },
   ]
 }
