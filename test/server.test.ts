@@ -62,6 +62,7 @@ interface MockHarness {
   readonly contexts: Map<string, SessionMessageInfo[]>
   readonly deliveries: DeliveredCall[]
   readonly emittedEvents: Array<{ rootSessionID: string; sessionID: string }>
+  readonly listInputs: SessionListInput[]
   readonly registeredTools: Map<string, ToolInfo & { id: string }>
   readonly removedTools: string[]
   readonly waitCalls: string[]
@@ -127,6 +128,7 @@ function createMockHarness(options: Record<string, unknown> = {}): MockHarness {
   const contexts = new Map<string, SessionMessageInfo[]>()
   const deliveries: DeliveredCall[] = []
   const emittedEvents: Array<{ rootSessionID: string; sessionID: string }> = []
+  const listInputs: SessionListInput[] = []
   const registeredTools = new Map<string, ToolInfo & { id: string }>()
   const removedTools: string[] = []
   const waitCalls: string[] = []
@@ -153,6 +155,7 @@ function createMockHarness(options: Record<string, unknown> = {}): MockHarness {
 
   const sessionDomain: Plugin.Context["session"] = {
     list: async (input?: SessionListInput) => {
+      listInputs.push(input ?? {})
       let rows = Array.from(sessions.values())
       if (input?.archived !== undefined) {
         rows = rows.filter((s) => (s.time.archived !== undefined) === input.archived)
@@ -416,6 +419,7 @@ function createMockHarness(options: Record<string, unknown> = {}): MockHarness {
     contexts,
     deliveries,
     emittedEvents,
+    listInputs,
     registeredTools,
     removedTools,
     waitCalls,
@@ -1088,6 +1092,55 @@ describe("opencode-session server plugin", () => {
         '<session_handoff from="ses_btw_1" title="Forked BTW">\nOPTIONS preflight was bypassed in cors.ts.\n</session_handoff>',
       )
     }
+  })
+
+  test("listHub scopes listing to the root session via parentID, caches repeats, and invalidates on writes", async () => {
+    const mock = createMockHarness()
+    mock.sessions.set("ses_root", makeSessionInfo({ id: "ses_root", projectID: "proj_1", title: "Root", created: 1000 }))
+    mock.sessions.set(
+      "ses_child",
+      makeSessionInfo({
+        id: "ses_child",
+        parentID: "ses_root",
+        projectID: "proj_1",
+        title: "Child",
+        agent: "explore",
+        created: 1100,
+      }),
+    )
+    for (let index = 0; index < 40; index += 1) {
+      mock.sessions.set(
+        `ses_other_${index}`,
+        makeSessionInfo({
+          id: `ses_other_${index}`,
+          projectID: "proj_2",
+          title: `Other ${index}`,
+          created: 1200 + index,
+        }),
+      )
+    }
+
+    await createSessionServer(mock.ctx, { reader: createMockReader() })
+    const rpc = mock.rpcHandlers()
+    const rpcCtx = { signal: new AbortController().signal, error: (() => new Error("rpc")) as never }
+
+    // Ignore the one-time watch hydration scan at startup.
+    mock.listInputs.length = 0
+
+    const first = await rpc.listHub({ rootSessionID: "ses_root" }, rpcCtx)
+    expect(first.items.map((item) => item.sessionID)).toEqual(["ses_child"])
+    expect(mock.listInputs.length).toBeGreaterThan(0)
+    expect(mock.listInputs.every((input) => typeof input.parentID === "string")).toBe(true)
+
+    const scans = mock.listInputs.length
+    const second = await rpc.listHub({ rootSessionID: "ses_root" }, rpcCtx)
+    expect(second.items.map((item) => item.sessionID)).toEqual(["ses_child"])
+    expect(mock.listInputs.length).toBe(scans)
+
+    await rpc.setHidden({ sessionID: "ses_child", hidden: true }, rpcCtx)
+    const third = await rpc.listHub({ rootSessionID: "ses_root" }, rpcCtx)
+    expect(third.items[0]?.hidden).toBe(true)
+    expect(mock.listInputs.length).toBeGreaterThan(scans)
   })
 
   test("registers all 10 Code Mode tools with pinned core primitives and honors replaceNativeSubagentTool", async () => {

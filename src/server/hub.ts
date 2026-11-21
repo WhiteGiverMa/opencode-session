@@ -101,6 +101,13 @@ export interface SessionHub {
 const decodeSessionMeta = Schema.decodeUnknownOption(O3pSessionMetaSchema)
 const decodeHubMeta = Schema.decodeUnknownOption(O3pSessionHubMetaSchema)
 
+/**
+ * A hub listing is read on the same keystroke by the footer badge and the
+ * aside panel, and again after every hide/unhide write. Keep one short-lived
+ * snapshot per root so the second reader reuses the first reader's work.
+ */
+const HUB_CACHE_TTL_MS = 1500
+
 export function parseSessionMeta(metadata: Record<string, unknown> | undefined): O3pSessionMeta | null {
   if (!metadata || !(META_KEY_SESSION in metadata)) return null
   return Option.getOrNull(decodeSessionMeta(metadata[META_KEY_SESSION]))
@@ -201,7 +208,14 @@ export function createSessionHub(host: SessionHubHost): SessionHub {
   const stagedSessions = new Map<string, StagedSessionSpec>()
   const materializingSessions = new Map<string, Promise<SessionInfo>>()
   const watchesByTarget = new Map<string, Map<string, WatchRecord>>()
+  const hubCache = new Map<string, { readonly at: number; readonly items: readonly HubItem[] }>()
+  const hubInflight = new Map<string, Promise<HubItem[]>>()
   let hydrated = false
+
+  const invalidateHubCache = (rootSessionID?: string): void => {
+    if (rootSessionID === undefined) hubCache.clear()
+    else hubCache.delete(rootSessionID)
+  }
 
   const stageSession = (input: StageSessionInput): StagedSessionSpec => {
     const spec: StagedSessionSpec = {
@@ -237,6 +251,7 @@ export function createSessionHub(host: SessionHubHost): SessionHub {
           title: derivedTitle,
         })
         newlyCreatedEmptySessions.add(created.id)
+        invalidateHubCache()
         if (spec.readonly) {
           await setReadonly({ sessionID: created.id, readonly: true })
         }
@@ -396,6 +411,7 @@ export function createSessionHub(host: SessionHubHost): SessionHub {
     })
     hubMetaCache.set(input.rootSessionID, nextHub)
     indexHubWatches(input.rootSessionID, nextHub)
+    invalidateHubCache(input.rootSessionID)
 
     if (host.emitUpdated) {
       await host.emitUpdated(input.rootSessionID, input.sessionID)
@@ -432,6 +448,7 @@ export function createSessionHub(host: SessionHubHost): SessionHub {
       },
     })
     sessionMetaCache.set(input.sessionID, nextMeta)
+    invalidateHubCache(nextMeta.rootSessionID)
 
     if (host.emitUpdated) {
       await host.emitUpdated(nextMeta.rootSessionID, input.sessionID)
@@ -468,6 +485,7 @@ export function createSessionHub(host: SessionHubHost): SessionHub {
       },
     })
     sessionMetaCache.set(input.sessionID, nextMeta)
+    invalidateHubCache(nextMeta.rootSessionID)
 
     if (host.emitUpdated) {
       await host.emitUpdated(nextMeta.rootSessionID, input.sessionID)
@@ -499,86 +517,52 @@ export function createSessionHub(host: SessionHubHost): SessionHub {
     return resolveRootSessionID(session)
   }
 
-  const listHub = async (rootSessionID: string): Promise<HubItem[]> => {
+  /**
+   * Builds the complete root-scoped session tree with parentID queries only.
+   * The previous implementation called `session.list` with no project or
+   * parent filter, so every reader scanned every session in every project in
+   * the database. Archived asides are fetched by ID because `archived: false`
+   * would omit them.
+   */
+  const buildHubItems = async (rootSessionID: string): Promise<HubItem[]> => {
     const { hub: rootHub } = await loadHubMeta(rootSessionID)
-    const nonArchived = await listAllNonArchivedSessions()
 
-    const sessionsByID = new Map<string, SessionInfo>()
-    for (const s of nonArchived) {
-      sessionsByID.set(s.id, s)
-    }
+    const collected = new Map<string, { session: SessionInfo; depth: number; meta: O3pSessionMeta | null }>()
+    const seen = new Set<string>([rootSessionID])
+    const asides: Array<{ id: string; depth: number }> = []
 
     const asideSessions = await Promise.all(
       rootHub.asideIDs.map((asideID) =>
-        sessionsByID.has(asideID)
-          ? Promise.resolve(sessionsByID.get(asideID) ?? null)
-          : host.session.get({ sessionID: asideID }).catch(() => null),
+        seen.has(asideID) ? Promise.resolve(null) : host.session.get({ sessionID: asideID }).catch(() => null),
       ),
     )
-
-    for (const s of asideSessions) {
-      if (s) {
-        sessionsByID.set(s.id, s)
-        cacheSessionSnapshot(s)
-      }
+    for (const aside of asideSessions) {
+      if (!aside || seen.has(aside.id)) continue
+      seen.add(aside.id)
+      cacheSessionSnapshot(aside)
+      collected.set(aside.id, { session: aside, depth: 1, meta: parseSessionMeta(aside.metadata) })
+      asides.push({ id: aside.id, depth: 1 })
     }
 
-    const childrenByParent = new Map<string, SessionInfo[]>()
-    for (const s of sessionsByID.values()) {
-      if (!s.parentID) continue
-      let list = childrenByParent.get(s.parentID)
-      if (!list) {
-        list = []
-        childrenByParent.set(s.parentID, list)
-      }
-      list.push(s)
-    }
-
-    const collected = new Map<string, { session: SessionInfo; depth: number; meta: O3pSessionMeta | null }>()
-
-    const queue: Array<{ id: string; depth: number }> = []
-    const seen = new Set<string>([rootSessionID])
-
-    for (const child of childrenByParent.get(rootSessionID) ?? []) {
-      if (!seen.has(child.id)) {
-        seen.add(child.id)
-        const meta = parseSessionMeta(child.metadata)
-        collected.set(child.id, { session: child, depth: 1, meta })
-        queue.push({ id: child.id, depth: 1 })
-      }
-    }
-
-    for (const asideID of rootHub.asideIDs) {
-      const aside = sessionsByID.get(asideID)
-      if (aside && !seen.has(aside.id)) {
-        seen.add(aside.id)
-        const meta = parseSessionMeta(aside.metadata)
-        collected.set(aside.id, { session: aside, depth: 1, meta })
-        queue.push({ id: aside.id, depth: 1 })
-      }
-    }
-
-    for (const s of sessionsByID.values()) {
-      const meta = parseSessionMeta(s.metadata)
-      if (meta && meta.rootSessionID === rootSessionID && !seen.has(s.id)) {
-        seen.add(s.id)
-        collected.set(s.id, { session: s, depth: 1, meta })
-        queue.push({ id: s.id, depth: 1 })
-      }
-    }
-
-    while (queue.length > 0) {
-      const current = queue.shift()
-      if (!current) break
-      for (const child of childrenByParent.get(current.id) ?? []) {
-        if (!seen.has(child.id)) {
+    let frontier: Array<{ id: string; depth: number }> = [{ id: rootSessionID, depth: 0 }, ...asides]
+    while (frontier.length > 0) {
+      const batches = await Promise.all(
+        frontier.map(async (current) => ({
+          current,
+          children: await listAllNonArchivedSessions(undefined, current.id),
+        })),
+      )
+      const next: Array<{ id: string; depth: number }> = []
+      for (const { current, children } of batches) {
+        for (const child of children) {
+          if (seen.has(child.id)) continue
           seen.add(child.id)
-          const meta = parseSessionMeta(child.metadata)
           const depth = current.depth + 1
-          collected.set(child.id, { session: child, depth, meta })
-          queue.push({ id: child.id, depth })
+          collected.set(child.id, { session: child, depth, meta: parseSessionMeta(child.metadata) })
+          next.push({ id: child.id, depth })
         }
       }
+      frontier = next
     }
 
     const sorted = Array.from(collected.values()).sort((a, b) => {
@@ -622,6 +606,27 @@ export function createSessionHub(host: SessionHubHost): SessionHub {
         updatedAt: s.time.updated,
       }
     })
+  }
+
+  const listHub = async (rootSessionID: string): Promise<HubItem[]> => {
+    const cached = hubCache.get(rootSessionID)
+    if (cached && Date.now() - cached.at < HUB_CACHE_TTL_MS) {
+      return [...cached.items]
+    }
+
+    const inflight = hubInflight.get(rootSessionID)
+    if (inflight) return inflight
+
+    const run = buildHubItems(rootSessionID)
+      .then((items) => {
+        hubCache.set(rootSessionID, { at: Date.now(), items })
+        return items
+      })
+      .finally(() => {
+        hubInflight.delete(rootSessionID)
+      })
+    hubInflight.set(rootSessionID, run)
+    return run
   }
 
   const resolveTargetSessionID = async (callerSessionID: string, target: string): Promise<string> => {
@@ -741,6 +746,11 @@ export function createSessionHub(host: SessionHubHost): SessionHub {
     wakeHops.set(event.sessionID, 0)
 
     const session = await host.session.get({ sessionID: event.sessionID }).catch(() => null)
+    if (session?.parentID) {
+      // A native subagent can appear without registerAside; never serve a
+      // listing that was built before its first prompt.
+      invalidateHubCache()
+    }
     if (session && session.parentID && isSessionIdle(session)) {
       humanTouchedIdleSubagents.add(event.sessionID)
     }
@@ -865,6 +875,7 @@ export function createSessionHub(host: SessionHubHost): SessionHub {
       stagedSessions.clear()
       materializingSessions.clear()
       watchesByTarget.clear()
+      invalidateHubCache()
       hydrated = false
     },
   }
