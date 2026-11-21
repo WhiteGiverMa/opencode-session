@@ -22,6 +22,7 @@ import {
   type UpdateTuiMemory,
 } from "./state.ts"
 import { setPointer } from "./ui-primitives.tsx"
+import { useSpinnerFrame } from "./spinner.ts"
 
 export interface SessionTreeManagerOptions {
   /** Live panel items; omit to fetch the hub when the dialog opens. */
@@ -109,6 +110,7 @@ function SessionTreeManager(props: SessionTreeManagerProps) {
   const rows = () => result().rows
 
   const running = (sessionID: string): boolean => context.data.session.status(sessionID) === "running"
+  const spinner = useSpinnerFrame(() => rows().some((row) => running(row.item.sessionID)))
 
   const patchHidden = (sessionID: string, hidden: boolean): void => {
     setPatches((current) => {
@@ -399,6 +401,11 @@ function SessionTreeManager(props: SessionTreeManagerProps) {
                     >
                       {row.prefix}
                     </text>
+                    <Show when={active()}>
+                      <text fg={theme.text.feedback.info.base} wrapMode="none" flexShrink={0} selectable={false}>
+                        {`${spinner()} `}
+                      </text>
+                    </Show>
                     <text fg={kindColor(row)} wrapMode="none" flexShrink={0} selectable={false}>
                       {sessionTreeKindBadge(row.item)}
                     </text>
@@ -414,11 +421,6 @@ function SessionTreeManager(props: SessionTreeManagerProps) {
                     >
                       {` ${sessionTreeTitle(row.item)}`}
                     </text>
-                    <Show when={active()}>
-                      <text fg={theme.text.feedback.info.base} wrapMode="none" flexShrink={0} selectable={false}>
-                        {" ●"}
-                      </text>
-                    </Show>
                     <Show when={row.item.hidden}>
                       <text fg={theme.text.feedback.warning.base} wrapMode="none" flexShrink={0} selectable={false}>
                         {" 已收起"}
@@ -432,7 +434,7 @@ function SessionTreeManager(props: SessionTreeManagerProps) {
                       flexShrink={0}
                       selectable={false}
                     >
-                      {`  ${formatSessionTreeMeta(row, active())}`}
+                      {`  ${formatSessionTreeMeta(row)}`}
                     </text>
                   </box>
                 )

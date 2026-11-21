@@ -31,6 +31,7 @@ import {
   availableSubagents,
   collapseShellPreview,
   errorMessage,
+  formatAsideTabTitle,
   formatDurationCompact,
   formatMessageRows,
   hiddenHubItems,
@@ -66,6 +67,7 @@ import {
   titlecaseAgent,
   useHostSyntaxStyle,
 } from "./ui-primitives.tsx"
+import { useSpinnerFrame } from "./spinner.ts"
 
 type Theme = Plugin.Context["theme"]
 
@@ -105,17 +107,6 @@ interface ContextMenuState {
   readonly item?: HubItem
 }
 
-function tabTitleText(item: HubItem): string {
-  const isDefaultForkTitle = item.kind === "btw" && /\(fork #\d+\)$/.test(item.title)
-  const title = (isDefaultForkTitle ? item.label : item.title || item.label) || item.sessionID
-  if (item.kind === "btw") {
-    const alias = item.alias.startsWith("#") ? item.alias : `#${item.index}`
-    return `◈ ${alias} ${title}`
-  }
-  if (item.kind === "sub") return `✦ @${item.agent ?? "agent"} ${title}`
-  return `${"›".repeat(Math.max(0, item.depth - 1))}@${item.agent ?? "agent"} ${title}`
-}
-
 function AdaptiveTabCell(props: {
   readonly context: Plugin.Context
   readonly item: HubItem
@@ -131,6 +122,7 @@ function AdaptiveTabCell(props: {
 }) {
   const theme = props.context.theme
   const [hovered, setHovered] = createSignal(false)
+  const spinner = useSpinnerFrame(() => props.running)
   const accent = createMemo(() => resolveHostAgentAccent(props.context, props.item.agent, props.newDesigns))
 
   onCleanup(() => {
@@ -143,7 +135,7 @@ function AdaptiveTabCell(props: {
     return undefined
   })
 
-  const hasIndicator = () => props.running || props.unread
+  const hasIndicator = () => props.unread
 
   return (
     <box
@@ -189,6 +181,11 @@ function AdaptiveTabCell(props: {
         props.onSelect()
       }}
     >
+      <Show when={props.running}>
+        <text fg={theme.text.feedback.info.base} wrapMode="none" flexShrink={0} selectable={false}>
+          {`${spinner()} `}
+        </text>
+      </Show>
       <text
         fg={props.selected || hovered() ? theme.text.base : theme.text.muted}
         attributes={props.selected ? TextAttributes.BOLD : undefined}
@@ -198,16 +195,11 @@ function AdaptiveTabCell(props: {
         minWidth={0}
         selectable={false}
       >
-        {tabTitleText(props.item)}
+        {formatAsideTabTitle(props.item)}
       </text>
       <Show when={hasIndicator()}>
-        <text
-          fg={props.running ? theme.text.feedback.info.base : theme.text.feedback.warning.base}
-          wrapMode="none"
-          flexShrink={0}
-          selectable={false}
-        >
-          {props.running ? " ●" : " •"}
+        <text fg={theme.text.feedback.warning.base} wrapMode="none" flexShrink={0} selectable={false}>
+          {" •"}
         </text>
       </Show>
     </box>
@@ -595,7 +587,7 @@ function TranscriptRow(props: {
       >
         <Show when={row.kind !== "user"}>
           <text fg={barColor} attributes={TextAttributes.BOLD} wrapMode="none" selectable={false}>
-            {row.kind === "synthetic" ? `◈ ${row.description || "跨会话来信"}` : row.description || "系统提示"}
+            {row.kind === "synthetic" ? row.description || "跨会话来信" : row.description || "系统提示"}
           </text>
         </Show>
         <text fg={props.theme.text.base} wrapMode="word">
@@ -648,7 +640,6 @@ function AsideEmptyState(props: {
         />
         <GuiButton
           context={props.context}
-          icon="✦"
           label="派遣 /sub"
           variant="ghost"
           onActivateHost={props.onActivateHost}
@@ -836,6 +827,7 @@ export function SessionPanel(props: SessionPanelProps) {
     const id = selectedID()
     return id !== undefined && context.data.session.status(id) === "running"
   })
+  const spinner = useSpinnerFrame(() => running())
   const messages = createMemo(() => {
     if (nativeTranscript) return []
     const id = selectedID()
@@ -1163,7 +1155,7 @@ export function SessionPanel(props: SessionPanelProps) {
       { title: "Recently closed tabs" },
       ...(closed.length > 0
         ? closed.map((item) => ({
-            title: `  ${tabTitleText(item)}`,
+            title: `  ${formatAsideTabTitle(item)}`,
             run: () => void restore(item),
           }))
         : [{ title: "  No recently closed tabs" }]),
@@ -1434,7 +1426,6 @@ export function SessionPanel(props: SessionPanelProps) {
           <Show when={!creation() && selected() && selected()?.kind !== "subagent"}>
             <GuiButton
               context={context}
-              icon={selected()?.readonly ? "●" : "◆"}
               label={selected()?.readonly ? "只读保护" : "读写已开"}
               variant={selected()?.readonly ? "success" : "warning"}
               onActivateHost={props.input.focus}
@@ -1451,7 +1442,6 @@ export function SessionPanel(props: SessionPanelProps) {
             />
             <GuiButton
               context={context}
-              icon="⚡"
               label="唤醒主线"
               variant="secondary"
               onActivateHost={props.input.focus}
@@ -1565,7 +1555,7 @@ export function SessionPanel(props: SessionPanelProps) {
                     <Show when={running()}>
                       <box padding={2}>
                         <text fg={theme.text.muted} selectable={false}>
-                          ● 正在思考中…
+                          {`${spinner()} 正在思考中…`}
                         </text>
                       </box>
                     </Show>
@@ -1688,7 +1678,6 @@ export function SessionPanel(props: SessionPanelProps) {
             />
             <GuiButton
               context={context}
-              icon="✦"
               label="派遣 /sub"
               variant="secondary"
               onActivateHost={props.input.focus}
@@ -1725,7 +1714,7 @@ export function SessionPanel(props: SessionPanelProps) {
             modelLabel={currentModelDisplay().modelName}
             providerLabel={currentModelDisplay().providerName}
             variantLabel={currentModelDisplay().variant}
-            statusLabel={running() ? "运行中 ●" : undefined}
+            statusLabel={running() ? "运行中" : undefined}
             running={running()}
             onActivateHost={props.input.focus}
             inputRef={(area) => {

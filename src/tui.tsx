@@ -104,7 +104,7 @@ function FooterBadge(props: {
     const panel = context.ui.panel.current()
     return panel?.name !== PANEL_NAME || panel.sessionID !== rootSessionID()
   })
-  const label = createMemo(() => formatFooterBadge(items(), running()))
+  const label = createMemo(() => formatFooterBadge(items()))
 
   return (
     <Show when={label() && (panelClosed() || running().size > 0)}>

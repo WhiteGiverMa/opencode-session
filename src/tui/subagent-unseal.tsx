@@ -223,7 +223,7 @@ export function SubagentUnseal(props: SubagentUnsealProps) {
             modelLabel={modelMeta().modelName}
             providerLabel={modelMeta().providerName}
             variantLabel={modelMeta().variant}
-            statusLabel={running() ? "运行中 ●" : undefined}
+            statusLabel={running() ? "运行中" : undefined}
             running={running()}
             minHeight={1}
             maxHeight={5}

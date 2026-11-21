@@ -169,6 +169,18 @@ export function hiddenHubItems(items: readonly HubItem[]): readonly HubItem[] {
   return items.filter((item) => item.hidden)
 }
 
+/**
+ * Tab strip label without decorative kind glyphs: running state is drawn by a
+ * separate braille spinner, and idle tabs stay plain text.
+ */
+export function formatAsideTabTitle(item: HubItem): string {
+  const isDefaultForkTitle = item.kind === "btw" && /\(fork #\d+\)$/.test(item.title)
+  const title = (isDefaultForkTitle ? item.label : item.title || item.label) || item.sessionID
+  if (item.kind !== "btw") return `@${item.agent ?? "agent"} ${title}`
+  const alias = item.alias.startsWith("#") ? item.alias : `#${item.index}`
+  return `btw ${alias} ${title}`
+}
+
 export function nextTabID(
   items: readonly HubItem[],
   currentID: string | undefined,
@@ -683,12 +695,11 @@ export function formatMessageRows(messages: readonly SessionMessage[]): readonly
   return rows
 }
 
-export function formatFooterBadge(items: readonly HubItem[], running: ReadonlySet<string>): string {
+export function formatFooterBadge(items: readonly HubItem[]): string {
   if (items.length === 0) return ""
   const kinds = new Set(items.map((item) => item.kind))
   const noun = kinds.size === 1 ? (items[0]?.kind === "subagent" ? "agents" : items[0]?.kind) : "asides"
-  const active = items.some((item) => running.has(item.sessionID))
-  return `◈ ${items.length} ${noun ?? "asides"}${active ? " ●" : ""}`
+  return `${items.length} ${noun ?? "asides"}`
 }
 
 /** Turn the live family store into HubItems; remote metadata wins during merge. */
@@ -792,9 +803,9 @@ export function sessionTreeTitle(item: HubItem): string {
 }
 
 export function sessionTreeKindBadge(item: HubItem): string {
-  if (item.kind === "btw") return "◈ btw"
-  if (item.kind === "sub") return "✦ sub"
-  return "↳ subagent"
+  if (item.kind === "btw") return "btw"
+  if (item.kind === "sub") return "sub"
+  return "subagent"
 }
 
 /**
@@ -943,22 +954,25 @@ export function filterSessionTree(items: readonly HubItem[], query: string): Ses
   }
 }
 
-export function formatSessionTreeTitle(row: SessionTreeRow, running: boolean): string {
-  const status = running ? "● " : ""
+/**
+ * One-line tree representation. Running state is rendered by the manager as a
+ * live braille spinner, so the string itself carries no status glyph.
+ */
+export function formatSessionTreeTitle(row: SessionTreeRow): string {
   const hidden = row.item.hidden ? " · 已收起" : ""
-  return `${row.prefix}${status}${sessionTreeKindBadge(row.item)} ${sessionTreeTitle(row.item)}${hidden}`
+  return `${row.prefix}${sessionTreeKindBadge(row.item)} ${sessionTreeTitle(row.item)}${hidden}`
 }
 
-export function formatSessionTreeMeta(row: SessionTreeRow, running: boolean): string {
+/**
+ * Right-side metadata. Closed/idle state lives in the row badge and spinner,
+ * so repeating `已收起` here would duplicate the warning badge.
+ */
+export function formatSessionTreeMeta(row: SessionTreeRow): string {
   const path = row.path.length > 0 ? ` · ${row.path.slice(-2).join(" › ")}` : ""
-  return [
-    row.item.alias,
-    row.item.agent ? `@${row.item.agent}` : "",
-    running ? "运行中" : "空闲",
-    row.item.hidden ? "已收起" : "已打开",
-  ]
+  const head = [row.item.alias, row.item.agent ? `@${row.item.agent}` : ""]
     .filter((part) => part.length > 0)
-    .join(" · ") + path
+    .join(" · ")
+  return `${head}${path}`
 }
 
 export function hubItemsEqual(left: HubItem, right: HubItem): boolean {

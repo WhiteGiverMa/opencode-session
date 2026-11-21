@@ -9,6 +9,7 @@ import {
   defaultSubagent,
   errorMessage,
   filterSessionTree,
+  formatAsideTabTitle,
   formatFooterBadge,
   formatMessageRows,
   formatSessionTreeMeta,
@@ -35,6 +36,7 @@ import {
   type SessionMessage,
   type SubagentChoice,
 } from "../src/tui/state.ts"
+import { normalizeSpinnerIndex, SPINNER_FRAMES, spinnerFrameAt } from "../src/tui/spinner.ts"
 
 const agents: readonly SubagentChoice[] = [
   { id: "build", mode: "primary" },
@@ -265,37 +267,12 @@ describe("transcript formatting", () => {
 })
 
 describe("footer status", () => {
-  it("summarizes aside count and exposes running activity", () => {
+  it("summarizes aside count without decorative glyphs", () => {
     const items = [hub("a"), hub("b", { index: 2 })]
-    expect(formatFooterBadge(items, new Set())).toBe("◈ 2 btw")
-    expect(formatFooterBadge(items, new Set(["b"]))).toBe("◈ 2 btw ●")
-    expect(formatFooterBadge([], new Set())).toBe("")
-  })
-})
-
-describe("adaptive tab layout and shell preview collapsing", () => {
-  it("distributes widths adaptively and reports overflow windows when crowded", () => {
-    const tabs = [hub("t1"), hub("t2"), hub("t3"), hub("t4"), hub("t5"), hub("t6")]
-    const roomy = adaptiveAsideTabLayout(tabs.slice(0, 2), "t1", 60, 0)
-    expect(roomy.tabs.map((t) => t.sessionID)).toEqual(["t1", "t2"])
-    expect(roomy.before).toBe(0)
-    expect(roomy.after).toBe(0)
-    expect(roomy.widths).toEqual([30, 30])
-
-    const crowded = adaptiveAsideTabLayout(tabs, "t5", 48, 0)
-    expect(crowded.tabs.some((t) => t.sessionID === "t5")).toBe(true)
-    expect(crowded.before).toBeGreaterThan(0)
-    const activeIdx = crowded.tabs.findIndex((t) => t.sessionID === "t5")
-    expect(crowded.widths[activeIdx]!).toBeGreaterThan(crowded.widths[0]!)
-  })
-
-  it("collapses multi-line shell output and counts hidden lines", () => {
-    const longOut = Array.from({ length: 15 }, (_, i) => `line ${i + 1}`).join("\n")
-    const collapsed = collapseShellPreview("$ git log --oneline", longOut, 6, 80)
-    expect(collapsed.commandLine).toBe("$ git log --oneline")
-    expect(collapsed.overflow).toBe(true)
-    expect(collapsed.hiddenLines).toBe(9)
-    expect(collapsed.previewOutput.split("\n")).toHaveLength(6)
+    expect(formatFooterBadge(items)).toBe("2 btw")
+    expect(formatFooterBadge([...items, hub("c", { kind: "sub", index: 3 })])).toBe("3 asides")
+    expect(formatFooterBadge([hub("a", { kind: "subagent" })])).toBe("1 agents")
+    expect(formatFooterBadge([])).toBe("")
   })
 })
 
@@ -338,6 +315,46 @@ describe("error message extraction", () => {
     expect(errorMessage({ foo: "bar" })).toContain("bar")
     expect(errorMessage({ message: "[object Object]" })).toBe("未知错误")
     expect(errorMessage(new Error("[object Object]"))).toBe("未知错误")
+  })
+})
+
+describe("braille spinner", () => {
+  it("cycles the same six-dot frames OpenCode uses natively", () => {
+    expect([...SPINNER_FRAMES]).toEqual(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+    expect(spinnerFrameAt(0)).toBe("⠋")
+    expect(spinnerFrameAt(1)).toBe("⠙")
+    expect(spinnerFrameAt(9)).toBe("⠏")
+    expect(spinnerFrameAt(10)).toBe("⠋")
+    expect(spinnerFrameAt(-1)).toBe("⠏")
+    expect(normalizeSpinnerIndex(9)).toBe(9)
+    expect(normalizeSpinnerIndex(10)).toBe(0)
+    expect(normalizeSpinnerIndex(-1)).toBe(9)
+  })
+})
+
+describe("adaptive tab layout and shell preview collapsing", () => {
+  it("distributes widths adaptively and reports overflow windows when crowded", () => {
+    const tabs = [hub("t1"), hub("t2"), hub("t3"), hub("t4"), hub("t5"), hub("t6")]
+    const roomy = adaptiveAsideTabLayout(tabs.slice(0, 2), "t1", 60, 0)
+    expect(roomy.tabs.map((t) => t.sessionID)).toEqual(["t1", "t2"])
+    expect(roomy.before).toBe(0)
+    expect(roomy.after).toBe(0)
+    expect(roomy.widths).toEqual([30, 30])
+
+    const crowded = adaptiveAsideTabLayout(tabs, "t5", 48, 0)
+    expect(crowded.tabs.some((t) => t.sessionID === "t5")).toBe(true)
+    expect(crowded.before).toBeGreaterThan(0)
+    const activeIdx = crowded.tabs.findIndex((t) => t.sessionID === "t5")
+    expect(crowded.widths[activeIdx]!).toBeGreaterThan(crowded.widths[0]!)
+  })
+
+  it("collapses multi-line shell output and counts hidden lines", () => {
+    const longOut = Array.from({ length: 15 }, (_, i) => `line ${i + 1}`).join("\n")
+    const collapsed = collapseShellPreview("$ git log --oneline", longOut, 6, 80)
+    expect(collapsed.commandLine).toBe("$ git log --oneline")
+    expect(collapsed.overflow).toBe(true)
+    expect(collapsed.hiddenLines).toBe(9)
+    expect(collapsed.previewOutput.split("\n")).toHaveLength(6)
   })
 })
 
@@ -430,16 +447,39 @@ describe("session tree manager", () => {
     const rows = buildSessionTreeRows(family)
     const hiddenRow = rows.find((row) => row.item.sessionID === "sa-b")!
     const parentRow = rows.find((row) => row.item.sessionID === "sa-parent")!
-    expect(sessionTreeKindBadge(parentRow.item)).toBe("↳ subagent")
-    expect(sessionTreeKindBadge(btw)).toBe("◈ btw")
-    expect(sessionTreeKindBadge(sub)).toBe("✦ sub")
-    expect(formatSessionTreeTitle(hiddenRow, false)).toContain("已收起")
-    expect(formatSessionTreeTitle(parentRow, true)).toContain("● ↳ subagent Explore repo")
-    expect(formatSessionTreeMeta(parentRow, true)).toContain("@explore")
-    expect(formatSessionTreeMeta(hiddenRow, false)).toContain("已收起")
-    expect(formatSessionTreeMeta(rows.find((row) => row.item.sessionID === "sa-g")!, false)).toContain(
+    expect(sessionTreeKindBadge(parentRow.item)).toBe("subagent")
+    expect(sessionTreeKindBadge(btw)).toBe("btw")
+    expect(sessionTreeKindBadge(sub)).toBe("sub")
+    expect(formatSessionTreeTitle(hiddenRow)).toContain("已收起")
+    expect(formatSessionTreeTitle(parentRow)).toContain("subagent Explore repo")
+    expect(formatSessionTreeMeta(parentRow)).toContain("@explore")
+    expect(formatSessionTreeMeta(rows.find((row) => row.item.sessionID === "sa-g")!)).toContain(
       "Explore repo › Child A",
     )
+
+    // Closed/idle state is carried by the row badge and spinner, not repeated
+    // in the right-hand metadata.
+    for (const row of rows) {
+      const meta = formatSessionTreeMeta(row)
+      const title = formatSessionTreeTitle(row)
+      expect(meta).not.toContain("已收起")
+      expect(meta).not.toContain("已打开")
+      expect(meta).not.toContain("空闲")
+      expect(title).not.toContain("●")
+      expect(`${title} ${meta}`).not.toMatch(/[✦◈]/)
+    }
+  })
+
+  it("keeps tab labels free of decorative kind glyphs", () => {
+    expect(formatAsideTabTitle(btw)).toBe("btw #1 Fork question")
+    expect(formatAsideTabTitle(sub)).toBe("@build Research sub")
+    expect(formatAsideTabTitle(parent)).toBe("@explore Explore repo")
+    expect(formatAsideTabTitle({ ...btw, title: "Fork question (fork #2)", label: "Short btw" })).toBe(
+      "btw #1 Short btw",
+    )
+    for (const item of [btw, sub, parent, childA, grand]) {
+      expect(formatAsideTabTitle(item)).not.toMatch(/[✦◈]/)
+    }
   })
 
   it("reuses unchanged HubItem objects across refreshes", () => {
