@@ -6,17 +6,16 @@ import {
   parseBtwArguments,
   parseSubArguments,
   rootSessionIDFor,
+  rpcOptions,
   type SessionRoute,
   type UpdateTuiMemory,
 } from "./state.ts"
+import { openSessionTreeManager } from "./tree-manager.tsx"
+
+export { rpcOptions }
 
 type KeymapLayer = ReturnType<Parameters<Plugin.Context["keymap"]["layer"]>[0]>
 export type PanelKeymapCommand = NonNullable<KeymapLayer["commands"]>[number]
-
-export function rpcOptions(context: Plugin.Context): { readonly location?: { readonly directory: string } } {
-  const directory = context.location?.directory
-  return directory ? { location: { directory } } : {}
-}
 
 function showError(context: Plugin.Context, error: unknown): void {
   context.ui.toast.show({ message: errorMessage(error), variant: "error" })
@@ -189,17 +188,24 @@ export interface PanelKeyActions {
   readonly interrupt: () => void
   readonly escape: () => void
   readonly toggleFullscreen: () => void
+  readonly openTree: () => void
   readonly jumpToLatest?: () => void
 }
 
-/** Non-text keys are safe while the mini composer is focused. */
+/**
+ * Non-text keys are safe while the mini composer is focused. `ctrl+x` is
+ * reserved for OpenCode's native `<leader>` prefix and must never be bound
+ * here: a direct binding competes with the leader token and swallows every
+ * secondary shortcut (`ctrl+x l`, `ctrl+x b`, ...).
+ */
 export function panelKeybindingCommands(actions: PanelKeyActions): readonly PanelKeymapCommand[] {
   return [
     { bind: "alt+[", title: "Previous aside", group: "Session", run: () => actions.cycleTab(-1) },
     { bind: "alt+]", title: "Next aside", group: "Session", run: () => actions.cycleTab(1) },
+    { bind: "alt+t", title: "Open session tree", group: "Session", run: actions.openTree },
     { bind: "ctrl+h", title: "Park latest answer in root inbox", group: "Session", run: () => actions.handoff("park") },
     { bind: "ctrl+shift+h", title: "Wake root with latest answer", group: "Session", run: () => actions.handoff("wake") },
-    { bind: "ctrl+x", title: "Interrupt aside", group: "Session", run: actions.interrupt },
+    { bind: "alt+x", title: "Interrupt aside", group: "Session", run: actions.interrupt },
     { bind: "ctrl+shift+f", title: "Toggle aside fullscreen", group: "Session", run: actions.toggleFullscreen },
     ...(actions.jumpToLatest
       ? [{ bind: "ctrl+end", title: "Jump to latest aside output", group: "Session", run: actions.jumpToLatest }]
@@ -282,6 +288,22 @@ export function registerSessionCommands(context: Plugin.Context, updateMemory: U
           if (!route) return
           if (context.ui.panel.current()?.name === PANEL_NAME) context.ui.panel.close()
           else context.ui.panel.open(PANEL_NAME)
+        },
+      },
+      {
+        id: "o3p.session.tree",
+        title: "Open the session tree manager",
+        description: "Find, reopen, hide, or interrupt every session in this root's tree",
+        group: "Session",
+        palette: true,
+        suggested: true,
+        bind: "alt+t",
+        slash: { name: "tree", aliases: ["aside-list", "sessions"] },
+        run() {
+          const route = currentSession(context)
+          if (!route) return
+          const rootSessionID = resolveRootSessionID(context, route.sessionID)
+          openSessionTreeManager(context, rootSessionID, updateMemory)
         },
       },
     ],

@@ -50,6 +50,17 @@ Add the plugin directory to `opencode.jsonc`:
 
 Disable the built-in modal `/btw` plugin once via `/plugins` -> `Ctrl+A` -> toggle `opencode.btw` off.
 
+## Commands and shortcuts
+
+| Entry / key | Action |
+| --- | --- |
+| `/btw [question]` | Fork a persistent aside and stream its answer in the right pane |
+| `/sub [@agent] [task]` | Spawn a named subagent directly into the right pane |
+| `/aside` (alias `/pager`) | Toggle the right-pane aside console; history and drafts are preserved |
+| `/tree` (aliases `/aside-list`, `/sessions`) or `Alt+T` | Open the session tree manager for the whole root family, including hidden asides; search, `Enter` to unhide/open, `Alt+H`/`Alt+U`/`Alt+I` to hide/unhide/interrupt |
+| `Ctrl+X` + secondary key in the pane | Reaches OpenCode's native `<leader>` sequences (e.g. `Ctrl+X L`, `Ctrl+X B`) unchanged |
+| `Alt+X` in the pane | Interrupt the current aside session |
+
 ## License
 
 [MIT](LICENSE)

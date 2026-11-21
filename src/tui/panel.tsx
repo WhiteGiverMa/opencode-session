@@ -13,6 +13,7 @@ import {
 } from "@opentui/core"
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show, untrack, type JSX } from "solid-js"
 import type { Store } from "solid-js/store"
+import stringWidth from "string-width"
 import { SessionRpc, type DeliveryMode, type HubItem } from "../contract.ts"
 import {
   createBtwAside,
@@ -42,6 +43,7 @@ import {
   resolveModelDisplay,
   resolveSelectedID,
   shouldFollowStreaming,
+  stabilizeHubItems,
   visibleHubItems,
   writeDraft,
   type MessageRow,
@@ -49,6 +51,7 @@ import {
   type TuiMemoryState,
   type UpdateTuiMemory,
 } from "./state.ts"
+import { openSessionTreeManager } from "./tree-manager.tsx"
 import {
   createHostScrollAcceleration,
   EmptyBorder,
@@ -603,6 +606,59 @@ function TranscriptRow(props: {
   )
 }
 
+function AsideEmptyState(props: {
+  readonly context: Plugin.Context
+  readonly itemsCount: number
+  readonly hiddenCount: number
+  readonly onOpenTree: () => void
+  readonly onNewBtw: () => void
+  readonly onNewSub: () => void
+  readonly onActivateHost: () => void
+}) {
+  const theme = props.context.theme
+  const summary =
+    props.itemsCount > 0
+      ? `当前没有打开的旁路会话${props.hiddenCount > 0 ? ` · ${props.hiddenCount} 个已收起` : ""}`
+      : "输入 /btw、/sub 或点右上角 + 开启旁路会话"
+  return (
+    <box padding={2} flexDirection="column" gap={1}>
+      <text fg={theme.text.muted} selectable={false}>
+        {summary}
+      </text>
+      <Show when={props.itemsCount > 0}>
+        <box flexDirection="row">
+          <GuiButton
+            context={props.context}
+            icon="⑂"
+            label={`查看/恢复会话树 (${props.itemsCount}${props.hiddenCount > 0 ? ` · ${props.hiddenCount} 收起` : ""})`}
+            variant={props.hiddenCount > 0 ? "primary" : "secondary"}
+            onActivateHost={props.onActivateHost}
+            onClick={props.onOpenTree}
+          />
+        </box>
+      </Show>
+      <box flexDirection="row" gap={1}>
+        <GuiButton
+          context={props.context}
+          icon="+"
+          label="新建 /btw"
+          variant="secondary"
+          onActivateHost={props.onActivateHost}
+          onClick={props.onNewBtw}
+        />
+        <GuiButton
+          context={props.context}
+          icon="✦"
+          label="派遣 /sub"
+          variant="ghost"
+          onActivateHost={props.onActivateHost}
+          onClick={props.onNewSub}
+        />
+      </box>
+    </box>
+  )
+}
+
 export function SessionPanel(props: SessionPanelProps) {
   const context = props.context
   const theme = context.theme
@@ -625,6 +681,9 @@ export function SessionPanel(props: SessionPanelProps) {
   const [contextMenu, setContextMenu] = createSignal<ContextMenuState>()
   const [localMessages, setLocalMessages] = createSignal<readonly SessionMessage[]>([])
   let refreshRevision = 0
+  let refreshInFlight: Promise<void> | undefined
+  let refreshQueued = false
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined
   let messageFetchRevision = 0
   let transcript: ScrollBoxRenderable | undefined
   let composer: TextareaRenderable | undefined
@@ -645,29 +704,60 @@ export function SessionPanel(props: SessionPanelProps) {
     }
   }
 
-  const refresh = async (): Promise<void> => {
+  const runRefresh = async (): Promise<void> => {
     const root = rootSessionID()
     const revision = ++refreshRevision
     try {
       const result = await rpc.listHub({ rootSessionID: root }, rpcOptions(context))
       if (revision !== refreshRevision || root !== rootSessionID()) return
-      setRemoteItems(result.items)
+      setRemoteItems((current) => stabilizeHubItems(current, result.items))
       setHubError("")
     } catch (error: unknown) {
       if (revision === refreshRevision) setHubError(errorMessage(error))
     }
   }
 
+  /** Coalesces the panel and footer readers, plus update-event bursts, onto one RPC. */
+  const refresh = (): Promise<void> => {
+    if (refreshInFlight) {
+      refreshQueued = true
+      return refreshInFlight
+    }
+    const run = runRefresh().finally(() => {
+      if (refreshInFlight === run) refreshInFlight = undefined
+      if (refreshQueued) {
+        refreshQueued = false
+        void refresh()
+      }
+    })
+    refreshInFlight = run
+    return run
+  }
+
+  const scheduleRefresh = (): void => {
+    if (refreshTimer !== undefined) return
+    refreshTimer = setTimeout(() => {
+      refreshTimer = undefined
+      void refresh()
+    }, 60)
+  }
+
   onMount(() => {
     onCleanup(
       rpc.events.on("updated", (event) => {
-        if (event.data.rootSessionID === rootSessionID()) void refresh()
+        if (event.data.rootSessionID === rootSessionID()) scheduleRefresh()
       }),
     )
+    onCleanup(() => {
+      if (refreshTimer !== undefined) {
+        clearTimeout(refreshTimer)
+        refreshTimer = undefined
+      }
+    })
     if (nativeTranscript) {
       // Native rows own message hydration and streaming. Only refresh the hub here.
       const refreshSelected = ({ data }: { data: { sessionID: string } }) => {
-        if (data.sessionID === selectedID()) void refresh()
+        if (data.sessionID === selectedID()) scheduleRefresh()
       }
       onCleanup(context.data.on("session.idle", refreshSelected))
       onCleanup(context.data.on("session.renamed", refreshSelected))
@@ -693,7 +783,7 @@ export function SessionPanel(props: SessionPanelProps) {
           context.data.session.message.invalidate(id)
           void context.data.session.sync(id).catch(() => undefined)
           void context.data.session.message.sync(id).catch(() => undefined)
-          void refresh()
+          scheduleRefresh()
         }
       }),
     )
@@ -707,7 +797,13 @@ export function SessionPanel(props: SessionPanelProps) {
     }),
   )
 
-  const items = createMemo(() => mergeHubItems(remoteItems(), liveFamilyItems(context, rootSessionID())))
+  let previousItems: readonly HubItem[] = []
+  const items = createMemo(() => {
+    const next = mergeHubItems(remoteItems(), liveFamilyItems(context, rootSessionID()))
+    const stable = stabilizeHubItems(previousItems, next)
+    previousItems = stable
+    return stable
+  })
   const visible = createMemo(() => visibleHubItems(items()))
   const hidden = createMemo(() => hiddenHubItems(items()))
   const selectedID = createMemo(() => resolveSelectedID(items(), props.memory.selectedByRoot[rootSessionID()]))
@@ -718,9 +814,18 @@ export function SessionPanel(props: SessionPanelProps) {
   })
 
   // Adaptive tab layout matching OpenCode v2 top bar (reserves 4 cols for `+` button)
+  // and the tree manager button, whose label grows with the hidden count.
+  const treeLabel = createMemo(
+    () => `${items().length}${hidden().length > 0 ? ` · ${hidden().length} 收起` : ""}`,
+  )
+  const treeCompact = createMemo(() => props.input.width < 44)
+  const treeButtonText = createMemo(() => (treeCompact() ? `${items().length}` : treeLabel()))
+  const treeButtonReserve = createMemo(() =>
+    items().length > 0 ? stringWidth(treeButtonText()) + 4 : 0,
+  )
   const tabLayout = createMemo(() => {
     const activeID = creation() ? undefined : selectedID()
-    const available = Math.max(12, props.input.width - 4)
+    const available = Math.max(12, props.input.width - 4 - treeButtonReserve())
     return adaptiveAsideTabLayout(visible(), activeID, available, untrack(tabWindowStart))
   })
   createEffect(() => {
@@ -770,6 +875,26 @@ export function SessionPanel(props: SessionPanelProps) {
     props.input.focus()
     queueMicrotask(() => {
       if (composer && !composer.isDestroyed) composer.focus()
+    })
+  }
+
+  const patchRemoteHidden = (sessionID: string, hidden: boolean): void => {
+    setRemoteItems((current) =>
+      current.map((item) => (item.sessionID === sessionID && item.hidden !== hidden ? { ...item, hidden } : item)),
+    )
+  }
+
+  const openTree = (): void => {
+    openSessionTreeManager(context, rootSessionID(), props.updateMemory, {
+      items,
+      selectedID,
+      onOpen: (sessionID) => {
+        // The tree manager unhides before opening. Make the panel agree
+        // immediately instead of waiting for the metadata round-trip.
+        patchRemoteHidden(sessionID, false)
+        selectSession(sessionID)
+      },
+      onChanged: () => void refresh(),
     })
   }
 
@@ -861,24 +986,33 @@ export function SessionPanel(props: SessionPanelProps) {
   })
 
   const hide = async (item: HubItem): Promise<void> => {
+    if (item.hidden) return
     if (selectedID() === item.sessionID) {
       const next = nextTabID(items(), item.sessionID, 1)
       if (next && next !== item.sessionID) selectSession(next)
       else props.updateMemory((draft) => delete draft.selectedByRoot[rootSessionID()])
     }
+    patchRemoteHidden(item.sessionID, true)
     try {
       await rpc.setHidden({ sessionID: item.sessionID, hidden: true }, rpcOptions(context))
       await refresh()
     } catch (error: unknown) {
+      patchRemoteHidden(item.sessionID, false)
       context.ui.toast.show({ message: errorMessage(error), variant: "error" })
     }
   }
   const restore = async (item: HubItem): Promise<void> => {
+    if (!item.hidden) {
+      selectSession(item.sessionID)
+      return
+    }
+    patchRemoteHidden(item.sessionID, false)
     try {
       await rpc.setHidden({ sessionID: item.sessionID, hidden: false }, rpcOptions(context))
       await refresh()
       selectSession(item.sessionID)
     } catch (error: unknown) {
+      patchRemoteHidden(item.sessionID, true)
       context.ui.toast.show({ message: errorMessage(error), variant: "error" })
     }
   }
@@ -892,6 +1026,13 @@ export function SessionPanel(props: SessionPanelProps) {
     if (!trimmed || trimmed === item.title) return
     try {
       await context.client.session.update({ sessionID: item.sessionID, title: trimmed })
+      setRemoteItems((current) =>
+        current.map((entry) =>
+          entry.sessionID === item.sessionID
+            ? { ...entry, title: trimmed, ...(entry.kind === "subagent" ? { label: trimmed } : {}) }
+            : entry,
+        ),
+      )
       context.data.session.invalidate(item.sessionID)
       await context.data.session.sync(item.sessionID)
       await refresh()
@@ -967,6 +1108,10 @@ export function SessionPanel(props: SessionPanelProps) {
   const buildContextMenuItems = (state: ContextMenuState): readonly PopupMenuItem[] => {
     const target = state.item
     const newActions: PopupMenuItem[] = [
+      {
+        title: "Session tree (find / reopen)",
+        run: openTree,
+      },
       {
         title: "New /btw aside",
         run: () => openInlineComposer(context, props.updateMemory, rootSessionID(), "btw"),
@@ -1085,6 +1230,7 @@ export function SessionPanel(props: SessionPanelProps) {
       interrupt: () => void interrupt(),
       escape,
       toggleFullscreen: props.input.toggleFullscreen,
+      openTree,
       jumpToLatest: nativeTranscript ? undefined : jumpToLatest,
     }),
   }))
@@ -1216,6 +1362,16 @@ export function SessionPanel(props: SessionPanelProps) {
           </Show>
         </box>
 
+        <Show when={items().length > 0}>
+          <GuiButton
+            context={context}
+            icon="⑂"
+            label={treeButtonText()}
+            variant={hidden().length > 0 ? "warning" : "ghost"}
+            onActivateHost={props.input.focus}
+            onClick={openTree}
+          />
+        </Show>
         <GuiButton
           context={context}
           label="+"
@@ -1383,11 +1539,23 @@ export function SessionPanel(props: SessionPanelProps) {
                 when={!creation() && selectedID()}
                 fallback={
                   <Show when={!creation()}>
-                    <box padding={2}>
-                      <text fg={theme.text.muted} selectable={false}>
-                        输入 /btw、/sub 或点右上角 + 开启旁路会话
-                      </text>
-                    </box>
+                    <AsideEmptyState
+                      context={context}
+                      itemsCount={items().length}
+                      hiddenCount={hidden().length}
+                      onOpenTree={openTree}
+                      onNewBtw={() => openInlineComposer(context, props.updateMemory, rootSessionID(), "btw")}
+                      onNewSub={() =>
+                        openInlineComposer(
+                          context,
+                          props.updateMemory,
+                          rootSessionID(),
+                          "sub",
+                          agents()[0]?.id ?? "explore",
+                        )
+                      }
+                      onActivateHost={props.input.focus}
+                    />
                   </Show>
                 }
               >
@@ -1459,10 +1627,24 @@ export function SessionPanel(props: SessionPanelProps) {
               keyed
               fallback={
                 <Show when={!creation()}>
-                  <box padding={1} flexGrow={1}>
-                    <text fg={theme.text.muted} selectable={false}>
-                      输入 /btw、/sub 或点右上角 + 开启旁路会话
-                    </text>
+                  <box flexGrow={1}>
+                    <AsideEmptyState
+                      context={context}
+                      itemsCount={items().length}
+                      hiddenCount={hidden().length}
+                      onOpenTree={openTree}
+                      onNewBtw={() => openInlineComposer(context, props.updateMemory, rootSessionID(), "btw")}
+                      onNewSub={() =>
+                        openInlineComposer(
+                          context,
+                          props.updateMemory,
+                          rootSessionID(),
+                          "sub",
+                          agents()[0]?.id ?? "explore",
+                        )
+                      }
+                      onActivateHost={props.input.focus}
+                    />
                   </box>
                 </Show>
               }

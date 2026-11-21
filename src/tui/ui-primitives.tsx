@@ -687,7 +687,9 @@ export function GraphicalPromptCard(props: GraphicalPromptCardProps) {
                 props.onSubmit(true)
                 return
               }
-              if (event.ctrl && event.name === "x" && props.onInterrupt) {
+              // Alt+X interrupts. Ctrl+X stays untouched so OpenCode's native
+              // `<leader>` prefix reaches the keymap from inside the composer.
+              if (event.meta && event.name === "x" && props.onInterrupt) {
                 event.preventDefault()
                 event.stopPropagation()
                 props.onInterrupt()

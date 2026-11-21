@@ -1,13 +1,19 @@
 import { describe, expect, it } from "bun:test"
 import type { HubItem } from "../src/contract.ts"
+import { panelKeybindingCommands } from "../src/tui/commands.ts"
 import {
   adaptiveAsideTabLayout,
+  buildSessionTreeRows,
   clampScrollOffset,
   collapseShellPreview,
   defaultSubagent,
+  filterSessionTree,
   formatFooterBadge,
   formatMessageRows,
+  formatSessionTreeMeta,
+  formatSessionTreeTitle,
   hiddenHubItems,
+  hubItemsEqual,
   isAwayFromBottom,
   maximumScrollTop,
   mergeHubItems,
@@ -15,10 +21,13 @@ import {
   parseBtwArguments,
   parseSubArguments,
   readDraft,
+  readO3pHubAsideIDs,
   readO3pSessionMeta,
   resolveSelectedID,
   rootSessionIDFor,
+  sessionTreeKindBadge,
   shouldFollowStreaming,
+  stabilizeHubItems,
   visibleHubItems,
   writeDraft,
   type SessionInfo,
@@ -174,6 +183,16 @@ describe("safe metadata resolution", () => {
     expect(fallbackCalls).toBe(0)
     expect(rootSessionIDFor({ id: "child", metadata: { o3pSession: { version: 2 } } }, "native-root")).toBe("native-root")
   })
+
+  it("reads only well-formed aside IDs from root hub metadata", () => {
+    expect(
+      readO3pHubAsideIDs({ o3pSessionHub: { version: 1, asideIDs: ["a", "b"], watches: [] } }),
+    ).toEqual(["a", "b"])
+    expect(readO3pHubAsideIDs({ o3pSessionHub: { version: 2, asideIDs: ["a"] } })).toEqual([])
+    expect(readO3pHubAsideIDs({ o3pSessionHub: { version: 1, asideIDs: ["a", 3, ""] } })).toEqual(["a"])
+    expect(readO3pHubAsideIDs({ o3pSessionHub: "bad" })).toEqual([])
+    expect(readO3pHubAsideIDs(undefined)).toEqual([])
+  })
 })
 
 describe("transcript formatting", () => {
@@ -276,5 +295,143 @@ describe("adaptive tab layout and shell preview collapsing", () => {
     expect(collapsed.overflow).toBe(true)
     expect(collapsed.hiddenLines).toBe(9)
     expect(collapsed.previewOutput.split("\n")).toHaveLength(6)
+  })
+})
+
+describe("session tree manager", () => {
+  const btw = hub("btw", { kind: "btw", alias: "btw-1", createdAt: 10, title: "Fork question", agent: "build" })
+  const parent = hub("sa-parent", {
+    kind: "subagent",
+    alias: "explore-1",
+    parentID: "root",
+    createdAt: 20,
+    title: "Explore repo",
+    agent: "explore",
+  })
+  const childA = hub("sa-a", {
+    kind: "subagent",
+    alias: "general-1",
+    parentID: "sa-parent",
+    createdAt: 30,
+    title: "Child A",
+    agent: "general",
+  })
+  const grand = hub("sa-g", {
+    kind: "subagent",
+    alias: "general-2",
+    parentID: "sa-a",
+    createdAt: 40,
+    title: "Grandchild",
+    agent: "general",
+  })
+  const childB = hub("sa-b", {
+    kind: "subagent",
+    alias: "general-3",
+    parentID: "sa-parent",
+    createdAt: 50,
+    title: "Child B",
+    agent: "general",
+    hidden: true,
+  })
+  const sub = hub("sub", { kind: "sub", alias: "sub-1", createdAt: 60, title: "Research sub", agent: "build" })
+  const family = [sub, grand, childB, parent, btw, childA]
+
+  it("builds the full depth-first tree with connectors and keeps hidden sessions", () => {
+    const rows = buildSessionTreeRows(family)
+    expect(rows.map((row) => row.item.sessionID)).toEqual([
+      "btw",
+      "sa-parent",
+      "sa-a",
+      "sa-g",
+      "sa-b",
+      "sub",
+    ])
+    expect(rows.map((row) => row.depth)).toEqual([1, 1, 2, 3, 2, 1])
+    expect(rows.map((row) => row.prefix)).toEqual(["├─ ", "├─ ", "│  ├─ ", "│  │  └─ ", "│  └─ ", "└─ "])
+    expect(rows.find((row) => row.item.sessionID === "sa-b")?.item.hidden).toBe(true)
+    expect(rows.find((row) => row.item.sessionID === "sa-g")?.path).toEqual(["Explore repo", "Child A"])
+  })
+
+  it("promotes orphans and cycle members instead of dropping them", () => {
+    const orphan = hub("orphan", { parentID: "missing", createdAt: 70 })
+    const a = hub("cycle-a", { parentID: "cycle-b", createdAt: 80 })
+    const b = hub("cycle-b", { parentID: "cycle-a", createdAt: 90 })
+    const rows = buildSessionTreeRows([orphan, a, b])
+    expect(rows.map((row) => row.item.sessionID).sort()).toEqual(["cycle-a", "cycle-b", "orphan"])
+    expect(rows.every((row) => row.depth === 1)).toBe(true)
+  })
+
+  it("keeps path context for a deep match and whole subtrees for a parent match", () => {
+    const deep = filterSessionTree([...family], "child b")
+    expect(deep.rows.map((row) => row.item.sessionID)).toEqual(["sa-parent", "sa-b"])
+    expect(deep.matched).toEqual(new Set(["sa-b"]))
+    expect(deep.context).toEqual(new Set(["sa-parent"]))
+    expect(deep.rows[1]?.prefix).toBe("   └─ ")
+
+    const parentMatch = filterSessionTree([...family], "explore")
+    expect(parentMatch.rows.map((row) => row.item.sessionID)).toEqual(["sa-parent", "sa-a", "sa-g", "sa-b"])
+    expect(parentMatch.matched).toEqual(new Set(["sa-parent"]))
+    expect(parentMatch.context).toEqual(new Set(["sa-a", "sa-g", "sa-b"]))
+
+    const hiddenMatch = filterSessionTree([...family], "sa-b")
+    expect(hiddenMatch.matched).toEqual(new Set(["sa-b"]))
+    expect(hiddenMatch.rows.some((row) => row.item.hidden)).toBe(true)
+
+    const hiddenSearch = filterSessionTree([...family], "hidden")
+    expect(hiddenSearch.rows.some((row) => row.item.sessionID === "sa-b")).toBe(true)
+
+    expect(filterSessionTree([...family], "   ").rows).toHaveLength(family.length)
+  })
+
+  it("formats kind badges, status, and hidden indicators", () => {
+    const rows = buildSessionTreeRows(family)
+    const hiddenRow = rows.find((row) => row.item.sessionID === "sa-b")!
+    const parentRow = rows.find((row) => row.item.sessionID === "sa-parent")!
+    expect(sessionTreeKindBadge(parentRow.item)).toBe("↳ subagent")
+    expect(sessionTreeKindBadge(btw)).toBe("◈ btw")
+    expect(sessionTreeKindBadge(sub)).toBe("✦ sub")
+    expect(formatSessionTreeTitle(hiddenRow, false)).toContain("已收起")
+    expect(formatSessionTreeTitle(parentRow, true)).toContain("● ↳ subagent Explore repo")
+    expect(formatSessionTreeMeta(parentRow, true)).toContain("@explore")
+    expect(formatSessionTreeMeta(hiddenRow, false)).toContain("已收起")
+    expect(formatSessionTreeMeta(rows.find((row) => row.item.sessionID === "sa-g")!, false)).toContain(
+      "Explore repo › Child A",
+    )
+  })
+
+  it("reuses unchanged HubItem objects across refreshes", () => {
+    const next = family.map((item) => ({ ...item }))
+    const stable = stabilizeHubItems(family, next)
+    expect(stable).toBe(family)
+
+    const changed = next.map((item) => (item.sessionID === "sa-a" ? { ...item, title: "Renamed" } : item))
+    const mixed = stabilizeHubItems(family, changed)
+    expect(mixed).not.toBe(family)
+    expect(mixed.find((item) => item.sessionID === "sa-parent")).toBe(parent)
+    expect(mixed.find((item) => item.sessionID === "sa-a")?.title).toBe("Renamed")
+    expect(hubItemsEqual(parent, next.find((item) => item.sessionID === "sa-parent")!)).toBe(true)
+  })
+})
+
+describe("aside keybindings", () => {
+  const commands = panelKeybindingCommands({
+    cycleTab: () => undefined,
+    handoff: () => undefined,
+    interrupt: () => undefined,
+    escape: () => undefined,
+    toggleFullscreen: () => undefined,
+    openTree: () => undefined,
+  })
+
+  it("never binds OpenCode's ctrl+x leader key", () => {
+    const bindings = commands.flatMap((command) =>
+      typeof command.bind === "string" ? command.bind.split(",").map((binding) => binding.trim()) : [],
+    )
+    expect(bindings).not.toContain("ctrl+x")
+  })
+
+  it("uses alt+x for interrupt and exposes the tree manager shortcut", () => {
+    expect(commands.find((command) => command.title === "Interrupt aside")?.bind).toBe("alt+x")
+    expect(commands.find((command) => command.title === "Open session tree")?.bind).toBe("alt+t")
   })
 })

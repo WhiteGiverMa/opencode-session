@@ -3,7 +3,7 @@ import { createEffect, createMemo, createSignal, on, onCleanup, onMount, Show } 
 import { PANEL_NAME, PLUGIN_ID, SessionRpc, type HubItem } from "./contract.ts"
 import { registerSessionCommands, resolveRootSessionID, rpcOptions } from "./tui/commands.ts"
 import { SessionPanel } from "./tui/panel.tsx"
-import { createTuiMemory, formatFooterBadge, liveFamilyItems, mergeHubItems } from "./tui/state.ts"
+import { createTuiMemory, formatFooterBadge, liveFamilyItems, mergeHubItems, stabilizeHubItems } from "./tui/state.ts"
 import { SubagentUnseal } from "./tui/subagent-unseal.tsx"
 import { GuiButton } from "./tui/ui-primitives.tsx"
 
@@ -15,6 +15,9 @@ function FooterBadge(props: {
   const rpc = context.client.rpc(SessionRpc)
   const [remote, setRemote] = createSignal<readonly HubItem[]>([])
   let revision = 0
+  let inFlight: Promise<void> | undefined
+  let queued = false
+  let timer: ReturnType<typeof setTimeout> | undefined
   const routeSessionID = () => {
     if (props.sessionID) return props.sessionID
     const route = context.ui.router.current()
@@ -24,7 +27,7 @@ function FooterBadge(props: {
     const id = routeSessionID()
     return id ? resolveRootSessionID(context, id) : undefined
   })
-  const refresh = async (): Promise<void> => {
+  const runRefresh = async (): Promise<void> => {
     const root = rootSessionID()
     if (!root) {
       setRemote([])
@@ -33,10 +36,34 @@ function FooterBadge(props: {
     const current = ++revision
     try {
       const result = await rpc.listHub({ rootSessionID: root }, rpcOptions(context))
-      if (current === revision && root === rootSessionID()) setRemote(result.items)
+      if (current === revision && root === rootSessionID()) {
+        setRemote((previous) => stabilizeHubItems(previous, result.items))
+      }
     } catch {
       // Native descendants remain available even if the optional RPC backend is offline.
     }
+  }
+  const refresh = (): Promise<void> => {
+    if (inFlight) {
+      queued = true
+      return inFlight
+    }
+    const run = runRefresh().finally(() => {
+      if (inFlight === run) inFlight = undefined
+      if (queued) {
+        queued = false
+        void refresh()
+      }
+    })
+    inFlight = run
+    return run
+  }
+  const scheduleRefresh = (): void => {
+    if (timer !== undefined) return
+    timer = setTimeout(() => {
+      timer = undefined
+      void refresh()
+    }, 60)
   }
   createEffect(
     on(rootSessionID, () => {
@@ -46,14 +73,24 @@ function FooterBadge(props: {
   )
   onMount(() => {
     const off = rpc.events.on("updated", (event) => {
-      if (event.data.rootSessionID === rootSessionID()) void refresh()
+      if (event.data.rootSessionID === rootSessionID()) scheduleRefresh()
     })
     onCleanup(off)
+    onCleanup(() => {
+      if (timer !== undefined) {
+        clearTimeout(timer)
+        timer = undefined
+      }
+    })
   })
 
+  let previousItems: readonly HubItem[] = []
   const items = createMemo(() => {
     const root = rootSessionID()
-    return root ? mergeHubItems(remote(), liveFamilyItems(context, root)) : []
+    if (!root) return []
+    const stable = stabilizeHubItems(previousItems, mergeHubItems(remote(), liveFamilyItems(context, root)))
+    previousItems = stable
+    return stable
   })
   const running = createMemo(
     () =>

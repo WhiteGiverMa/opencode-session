@@ -1,6 +1,7 @@
 import type { Plugin } from "@opencode/plugin/tui"
 import type { Store } from "solid-js/store"
 import {
+  META_KEY_HUB,
   META_KEY_SESSION,
   PLUGIN_ID,
   type HubItem,
@@ -57,8 +58,7 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** Validate untrusted persisted metadata instead of casting Json/unknown. */
-export function readO3pSessionMeta(metadata: unknown): O3pSessionMeta | undefined {
-  if (!isRecord(metadata)) return undefined
+export function readO3pSessionMeta(metadata: unknown): O3pSessionMeta | undefined {  if (!isRecord(metadata)) return undefined
   const value = metadata[META_KEY_SESSION]
   if (!isRecord(value)) return undefined
   if (
@@ -84,8 +84,15 @@ export function readO3pSessionMeta(metadata: unknown): O3pSessionMeta | undefine
   }
 }
 
-export function rootSessionIDFor(
-  session: Pick<SessionInfo, "id" | "metadata"> | undefined,
+/** Returns the aside IDs recorded on a root session without trusting malformed metadata. */
+export function readO3pHubAsideIDs(metadata: unknown): readonly string[] {
+  if (!isRecord(metadata)) return []
+  const value = metadata[META_KEY_HUB]
+  if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.asideIDs)) return []
+  return value.asideIDs.filter((id): id is string => typeof id === "string" && id.length > 0)
+}
+
+export function rootSessionIDFor(  session: Pick<SessionInfo, "id" | "metadata"> | undefined,
   fallback: string | (() => string),
 ): string {
   const fromMetadata = readO3pSessionMeta(session?.metadata)?.rootSessionID
@@ -687,11 +694,31 @@ export function formatFooterBadge(items: readonly HubItem[], running: ReadonlySe
 /** Turn the live family store into HubItems; remote metadata wins during merge. */
 export function liveFamilyItems(context: Plugin.Context, rootSessionID: string): readonly HubItem[] {
   const family = context.data.session.family(rootSessionID)
+  const sessionIDs: string[] = []
+  const seen = new Set<string>([rootSessionID])
+  for (const sessionID of family) {
+    if (seen.has(sessionID)) continue
+    seen.add(sessionID)
+    sessionIDs.push(sessionID)
+  }
+  // `/btw` forks have `parentID: null`, so the native family index does not
+  // contain them. The root's hub metadata does; reading it here lets the
+  // footer and panel paint every aside before the hub RPC returns.
+  for (const sessionID of readO3pHubAsideIDs(context.data.session.get(rootSessionID)?.metadata)) {
+    if (seen.has(sessionID)) continue
+    seen.add(sessionID)
+    sessionIDs.push(sessionID)
+  }
+
   const items: HubItem[] = []
-  family.forEach((sessionID, familyIndex) => {
-    if (sessionID === rootSessionID) return
+  sessionIDs.forEach((sessionID, familyIndex) => {
     const info = context.data.session.get(sessionID)
-    if (!info?.parentID || readO3pSessionMeta(info.metadata)) return
+    if (!info) return
+    const meta = readO3pSessionMeta(info.metadata)
+    // Top-level peers have no parent and no aside marker; they are not part of
+    // this root's family tree. Asides stay in the live family even though they
+    // are archived, so the panel can render its tabs before the hub RPC lands.
+    if (!info.parentID && !meta) return
 
     let depth = 1
     let parentID: string | undefined = info.parentID
@@ -702,15 +729,16 @@ export function liveFamilyItems(context: Plugin.Context, rootSessionID: string):
       parentID = context.data.session.get(parentID)?.parentID
     }
     const agent = info.agent ?? null
-    const label = info.title?.trim() || agent || sessionID
+    const kind: HubItem["kind"] = meta?.kind ?? "subagent"
+    const label = meta?.label ?? (info.title?.trim() || agent || sessionID)
     items.push({
       sessionID,
       rootSessionID,
-      parentID: info.parentID,
-      kind: "subagent",
+      parentID: info.parentID ?? null,
+      kind,
       depth,
       index: familyIndex + 1,
-      alias: `↳${depth}`,
+      alias: kind === "btw" ? `#${familyIndex + 1}` : `↳${depth}`,
       title: info.title ?? label,
       label,
       agent,
@@ -721,14 +749,263 @@ export function liveFamilyItems(context: Plugin.Context, rootSessionID: string):
             ...(info.model.variant ? { variant: info.model.variant } : {}),
           }
         : null,
-      readonly: false,
-      hidden: false,
+      readonly: meta?.readonly ?? false,
+      hidden: meta?.hidden ?? false,
       archived: info.time.archived !== undefined,
       createdAt: info.time.created,
       updatedAt: info.time.updated,
     })
   })
   return items
+}
+
+export function rpcOptions(context: Plugin.Context): { readonly location?: { readonly directory: string } } {
+  const directory = context.location?.directory
+  return directory ? { location: { directory } } : {}
+}
+
+// ---------------------------------------------------------------------------
+// Session tree manager (tree construction, filtering, stable identity)
+// ---------------------------------------------------------------------------
+
+export interface SessionTreeRow {
+  readonly item: HubItem
+  readonly depth: number
+  /** `├─ ` / `└─ ` plus ancestor continuation columns. */
+  readonly prefix: string
+  /** Ancestor titles from the root down to the parent. */
+  readonly path: readonly string[]
+}
+
+export interface SessionTreeFilterResult {
+  readonly rows: readonly SessionTreeRow[]
+  readonly matched: ReadonlySet<string>
+  readonly context: ReadonlySet<string>
+}
+
+function compareHubItems(left: HubItem, right: HubItem): number {
+  return left.createdAt - right.createdAt || left.index - right.index || left.sessionID.localeCompare(right.sessionID)
+}
+
+export function sessionTreeTitle(item: HubItem): string {
+  return item.title.trim() || item.label.trim() || item.sessionID
+}
+
+export function sessionTreeKindBadge(item: HubItem): string {
+  if (item.kind === "btw") return "◈ btw"
+  if (item.kind === "sub") return "✦ sub"
+  return "↳ subagent"
+}
+
+/**
+ * Builds a depth-first tree from parentID links. Hidden sessions stay in the
+ * tree on purpose: the manager is how a closed tab is found and reopened.
+ * Items whose parent is outside the list are promoted to roots so a partially
+ * loaded page never loses a session.
+ */
+export function buildSessionTreeRows(items: readonly HubItem[]): readonly SessionTreeRow[] {
+  const sorted = [...items].sort(compareHubItems)
+  const byID = new Map(sorted.map((item) => [item.sessionID, item]))
+  const children = new Map<string, HubItem[]>()
+  for (const item of sorted) {
+    const parentID =
+      item.parentID && item.parentID !== item.sessionID && byID.has(item.parentID) ? item.parentID : ""
+    const list = children.get(parentID)
+    if (list) list.push(item)
+    else children.set(parentID, [item])
+  }
+
+  const rows: SessionTreeRow[] = []
+  const emitted = new Set<string>()
+
+  const emit = (parentID: string, depth: number, ancestry: readonly boolean[], path: readonly string[]): void => {
+    const siblings = children.get(parentID) ?? []
+    siblings.forEach((item, index) => {
+      if (emitted.has(item.sessionID)) return
+      emitted.add(item.sessionID)
+      const last = index === siblings.length - 1
+      const ancestorPrefix = ancestry.map((ancestorLast) => (ancestorLast ? "   " : "│  ")).join("")
+      const prefix = `${ancestorPrefix}${last ? "└─ " : "├─ "}`
+      const label = sessionTreeTitle(item)
+      rows.push({ item, depth, prefix, path })
+      emit(item.sessionID, depth + 1, [...ancestry, last], [...path, label])
+    })
+  }
+
+  emit("", 1, [], [])
+
+  // Cycles and otherwise unreachable nodes still surface as roots instead of
+  // silently disappearing from the manager.
+  for (const item of sorted) {
+    if (emitted.has(item.sessionID)) continue
+    emitted.add(item.sessionID)
+    rows.push({ item, depth: 1, prefix: "└─ ", path: [] })
+  }
+
+  return rows
+}
+
+function fuzzyIncludes(haystack: string, needle: string): boolean {
+  const text = haystack.toLowerCase()
+  const query = needle.toLowerCase()
+  if (query.length === 0 || text.includes(query)) return true
+  let cursor = 0
+  for (const char of query) {
+    const found = text.indexOf(char, cursor)
+    if (found === -1) return false
+    cursor = found + 1
+  }
+  return true
+}
+
+function sessionTreeFields(item: HubItem): readonly string[] {
+  return [
+    item.title,
+    item.label,
+    item.agent ?? "",
+    item.kind,
+    item.alias,
+    item.sessionID,
+    String(item.index),
+    item.hidden ? "已收起 hidden closed" : "已打开 visible open",
+  ]
+}
+
+function sessionTreeMatches(item: HubItem, query: string, tokens: readonly string[]): boolean {
+  return sessionTreeFields(item).some((field) => {
+    const text = field.toLowerCase()
+    // All tokens must agree on one field so a stray letter cannot match an
+    // unrelated field (e.g. "child b" should not hit every "subagent").
+    return text.includes(query) || tokens.every((token) => fuzzyIncludes(text, token))
+  })
+}
+
+/**
+ * Filters a session tree while retaining the path needed to understand each
+ * hit: ancestors of a match and every descendant of a match stay visible.
+ * Connectors are rebuilt from the retained subset, so the branch shape is
+ * honest instead of showing holes from removed siblings.
+ */
+export function filterSessionTree(items: readonly HubItem[], query: string): SessionTreeFilterResult {
+  const tokens = query
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((token) => token.length > 0)
+  if (tokens.length === 0) {
+    return {
+      rows: buildSessionTreeRows(items),
+      matched: new Set(items.map((item) => item.sessionID)),
+      context: new Set(),
+    }
+  }
+
+  const byID = new Map(items.map((item) => [item.sessionID, item]))
+  const children = new Map<string, HubItem[]>()
+  for (const item of items) {
+    if (!item.parentID || !byID.has(item.parentID)) continue
+    const list = children.get(item.parentID)
+    if (list) list.push(item)
+    else children.set(item.parentID, [item])
+  }
+
+  const normalized = tokens.join(" ")
+  const matched = new Set<string>()
+  for (const item of items) {
+    if (sessionTreeMatches(item, normalized, tokens)) matched.add(item.sessionID)
+  }
+
+  const keep = new Set(matched)
+  for (const sessionID of matched) {
+    let parentID = byID.get(sessionID)?.parentID ?? null
+    const visited = new Set<string>([sessionID])
+    while (parentID && byID.has(parentID) && !visited.has(parentID)) {
+      visited.add(parentID)
+      keep.add(parentID)
+      parentID = byID.get(parentID)?.parentID ?? null
+    }
+  }
+
+  const addDescendants = (sessionID: string): void => {
+    for (const child of children.get(sessionID) ?? []) {
+      if (keep.has(child.sessionID)) continue
+      keep.add(child.sessionID)
+      addDescendants(child.sessionID)
+    }
+  }
+  for (const sessionID of matched) addDescendants(sessionID)
+
+  const kept = items.filter((item) => keep.has(item.sessionID))
+  return {
+    rows: buildSessionTreeRows(kept),
+    matched,
+    context: new Set([...keep].filter((sessionID) => !matched.has(sessionID))),
+  }
+}
+
+export function formatSessionTreeTitle(row: SessionTreeRow, running: boolean): string {
+  const status = running ? "● " : ""
+  const hidden = row.item.hidden ? " · 已收起" : ""
+  return `${row.prefix}${status}${sessionTreeKindBadge(row.item)} ${sessionTreeTitle(row.item)}${hidden}`
+}
+
+export function formatSessionTreeMeta(row: SessionTreeRow, running: boolean): string {
+  const path = row.path.length > 0 ? ` · ${row.path.slice(-2).join(" › ")}` : ""
+  return [
+    row.item.alias,
+    row.item.agent ? `@${row.item.agent}` : "",
+    running ? "运行中" : "空闲",
+    row.item.hidden ? "已收起" : "已打开",
+  ]
+    .filter((part) => part.length > 0)
+    .join(" · ") + path
+}
+
+export function hubItemsEqual(left: HubItem, right: HubItem): boolean {
+  const modelEqual =
+    left.model === right.model ||
+    (left.model !== null &&
+      right.model !== null &&
+      left.model.providerID === right.model.providerID &&
+      left.model.id === right.model.id &&
+      left.model.variant === right.model.variant)
+  return (
+    left.sessionID === right.sessionID &&
+    left.rootSessionID === right.rootSessionID &&
+    left.parentID === right.parentID &&
+    left.kind === right.kind &&
+    left.depth === right.depth &&
+    left.index === right.index &&
+    left.alias === right.alias &&
+    left.title === right.title &&
+    left.label === right.label &&
+    left.agent === right.agent &&
+    modelEqual &&
+    left.readonly === right.readonly &&
+    left.hidden === right.hidden &&
+    left.archived === right.archived &&
+    left.createdAt === right.createdAt &&
+    left.updatedAt === right.updatedAt
+  )
+}
+
+/**
+ * Reuses the previous HubItem object for every unchanged row. Without this,
+ * each hub refresh replaces all items and Solid's <For> recreates every tab
+ * cell (and every downstream effect) even when nothing changed.
+ */
+export function stabilizeHubItems(previous: readonly HubItem[], next: readonly HubItem[]): readonly HubItem[] {
+  if (
+    previous.length === next.length &&
+    previous.every((item, index) => hubItemsEqual(item, next[index]!))
+  ) {
+    return previous
+  }
+  const byID = new Map(previous.map((item) => [item.sessionID, item]))
+  return next.map((item) => {
+    const old = byID.get(item.sessionID)
+    return old && hubItemsEqual(old, item) ? old : item
+  })
 }
 
 export interface ModelDisplayMeta {
