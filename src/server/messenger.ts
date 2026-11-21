@@ -43,6 +43,14 @@ export interface HandoffResult {
   readonly delivery: DeliveryMode
 }
 
+/** Raised when there is no completed assistant text to send to the root. */
+export class HandoffNoReplyError extends Error {
+  constructor(readonly sessionID: string) {
+    super("当前会话还没有已完成的助手回复，无法送回主线")
+    this.name = "HandoffNoReplyError"
+  }
+}
+
 export interface SessionMessenger {
   deliverSessionMessage(input: DeliverSessionMessageInput): Promise<DeliverSessionMessageResult>
   handoff(input: HandoffInput): Promise<HandoffResult>
@@ -212,7 +220,7 @@ export function createSessionMessenger(host: SessionMessengerHost): SessionMesse
         : await host.hub.extractLatestAssistantText(input.fromSessionID)
 
     if (body.length === 0) {
-      throw new Error(`No completed assistant reply found in session ${input.fromSessionID} for handoff`)
+      throw new HandoffNoReplyError(input.fromSessionID)
     }
 
     const text = [

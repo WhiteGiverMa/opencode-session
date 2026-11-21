@@ -3,7 +3,7 @@ import type { Registration } from "@opencode/plugin/promise/registration"
 import type { RpcRegistration } from "@opencode/plugin/promise/rpc"
 import { parsePluginConfig, PLUGIN_ID, SessionRpc, type SqliteSessionReader } from "./contract.ts"
 import { createSessionHub } from "./server/hub.ts"
-import { createSessionMessenger } from "./server/messenger.ts"
+import { createSessionMessenger, HandoffNoReplyError } from "./server/messenger.ts"
 import { createLazySqliteReader, registerSessionTools } from "./server/tools.ts"
 
 export interface SessionServerDeps {
@@ -51,7 +51,18 @@ export async function createSessionServer(
       listHub: async (input) => ({
         items: await hub.listHub(input.rootSessionID),
       }),
-      handoff: async (input) => messenger.handoff(input),
+      handoff: async (input, callContext) => {
+        try {
+          return await messenger.handoff(input)
+        } catch (error) {
+          // Translate "nothing to hand off" into a declared RPC error so the
+          // TUI shows the real reason instead of a generic `rpc.internal`.
+          if (error instanceof HandoffNoReplyError) {
+            return callContext.error("handoffNoReply", error.message, { sessionID: error.sessionID })
+          }
+          throw error
+        }
+      },
     })
     registrations.push(rpcRegistration)
 

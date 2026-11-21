@@ -390,6 +390,13 @@ export const SessionRpc = Rpc.define({
           delivery: DeliveryMode,
         }),
       ),
+      errors: {
+        handoffNoReply: Schema.toStandardSchemaV1(
+          Schema.Struct({
+            sessionID: Schema.String,
+          }),
+        ),
+      },
     },
   },
   events: {

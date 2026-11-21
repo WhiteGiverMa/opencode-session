@@ -7,6 +7,7 @@ import {
   clampScrollOffset,
   collapseShellPreview,
   defaultSubagent,
+  errorMessage,
   filterSessionTree,
   formatFooterBadge,
   formatMessageRows,
@@ -295,6 +296,48 @@ describe("adaptive tab layout and shell preview collapsing", () => {
     expect(collapsed.overflow).toBe(true)
     expect(collapsed.hiddenLines).toBe(9)
     expect(collapsed.previewOutput.split("\n")).toHaveLength(6)
+  })
+})
+
+describe("error message extraction", () => {
+  it("unwraps Error, RPC, Effect, and HTTP error shapes", () => {
+    expect(errorMessage(new Error("plain failure"))).toBe("plain failure")
+    expect(errorMessage("string failure")).toBe("string failure")
+    expect(errorMessage({ type: "rpc.internal", message: "RPC call failed" })).toBe("RPC call failed")
+    expect(errorMessage({ message: "top level" })).toBe("top level")
+    expect(errorMessage({ data: { message: "nested data" } })).toBe("nested data")
+    expect(errorMessage({ error: { message: "nested error" } })).toBe("nested error")
+    expect(errorMessage({ cause: new Error("caused by network") })).toBe("caused by network")
+    expect(errorMessage({ body: { error: "body failure" } })).toBe("body failure")
+    expect(errorMessage({ error: { cause: { data: { message: "deep" } } } })).toBe("deep")
+    expect(errorMessage({ _tag: "Cause", reasons: [{ _tag: "Fail", error: { message: "effect failure" } }] })).toBe(
+      "effect failure",
+    )
+    expect(errorMessage({ type: "handoffNoReply", message: "当前会话还没有已完成的助手回复，无法送回主线" })).toBe(
+      "当前会话还没有已完成的助手回复，无法送回主线",
+    )
+  })
+
+  it("never renders an object as [object Object]", () => {
+    const cyclic: Record<string, unknown> = { type: "rpc.internal" }
+    cyclic.self = cyclic
+    const values: readonly unknown[] = [
+      {},
+      { type: "rpc.internal" },
+      { foo: "bar" },
+      { data: { code: 1 } },
+      Object.create(null) as unknown,
+      cyclic,
+      [1, 2, 3],
+    ]
+    for (const value of values) {
+      const message = errorMessage(value)
+      expect(message).not.toBe("[object Object]")
+      expect(message.length).toBeGreaterThan(0)
+    }
+    expect(errorMessage({ foo: "bar" })).toContain("bar")
+    expect(errorMessage({ message: "[object Object]" })).toBe("未知错误")
+    expect(errorMessage(new Error("[object Object]"))).toBe("未知错误")
   })
 })
 

@@ -1000,6 +1000,10 @@ describe("opencode-session server plugin", () => {
       "ses_sa_3",
       makeSessionInfo({ id: "ses_sa_3", parentID: "ses_root", title: "Second General", agent: "general", created: 1500 }),
     )
+    mock.sessions.set(
+      "ses_empty",
+      makeSessionInfo({ id: "ses_empty", title: "Errored aside without text", created: 1600 }),
+    )
 
     mock.contexts.set("ses_btw_1", [
       {
@@ -1014,7 +1018,15 @@ describe("opencode-session server plugin", () => {
 
     await createSessionServer(mock.ctx, { reader: createMockReader() })
     const rpc = mock.rpcHandlers()
-    const rpcCtx = { signal: new AbortController().signal, error: (() => new Error("rpc")) as never }
+    const rpcFailures: Array<{ type: string; message: string; data?: unknown }> = []
+    const rpcCtx = {
+      signal: new AbortController().signal,
+      error: (type: string, message: string, data?: unknown) => {
+        const failure = { type, message, ...(data === undefined ? {} : { data }) }
+        rpcFailures.push(failure)
+        return failure
+      },
+    } as never
 
     // registerAside sets metadata + archived: true + appends to root asideIDs + preserves existing keys
     const regBtw = await rpc.registerAside(
@@ -1081,8 +1093,10 @@ describe("opencode-session server plugin", () => {
       },
       rpcCtx,
     )
-    expect(handoffRes.delivery).toBe("park")
-    expect(handoffRes.preview).toContain("OPTIONS preflight")
+    expect(handoffRes).toMatchObject({
+      delivery: "park",
+      preview: expect.stringContaining("OPTIONS preflight"),
+    })
     const syn = mock.deliveries.at(-1)
     expect(syn?.kind).toBe("synthetic")
     if (syn?.kind === "synthetic") {
@@ -1092,6 +1106,23 @@ describe("opencode-session server plugin", () => {
         '<session_handoff from="ses_btw_1" title="Forked BTW">\nOPTIONS preflight was bypassed in cors.ts.\n</session_handoff>',
       )
     }
+
+    // A session whose turn errored before producing assistant text reports a
+    // declared, human-readable RPC failure instead of a generic rpc.internal.
+    const noReply = await rpc.handoff(
+      {
+        fromSessionID: "ses_empty",
+        toSessionID: "ses_root",
+        delivery: "wake",
+      },
+      rpcCtx,
+    )
+    expect(noReply).toMatchObject({
+      type: "handoffNoReply",
+      message: "当前会话还没有已完成的助手回复，无法送回主线",
+      data: { sessionID: "ses_empty" },
+    })
+    expect(rpcFailures.at(-1)).toMatchObject({ type: "handoffNoReply" })
   })
 
   test("listHub scopes listing to the root session via parentID, caches repeats, and invalidates on writes", async () => {

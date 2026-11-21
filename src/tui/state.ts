@@ -1038,8 +1038,70 @@ export function resolveModelDisplay(
   }
 }
 
+const ERROR_MESSAGE_DEPTH_LIMIT = 6
+const ERROR_MESSAGE_KEYS = [
+  "message",
+  "error",
+  "detail",
+  "details",
+  "reason",
+  "reasons",
+  "failure",
+  "defect",
+  "body",
+  "cause",
+  "data",
+] as const
+
+/**
+ * RPC failures arrive as plain `{ type, message, data }` objects, HTTP clients
+ * wrap them as `{ error: { message } }`, and Effect may carry a `cause`. Walk
+ * all of those shapes instead of relying on `String(error)`.
+ */
+function nestedErrorMessage(value: unknown, depth: number, seen: Set<object>): string | undefined {
+  if (value === null || value === undefined) return undefined
+  if (typeof value === "string") {
+    const text = value.trim()
+    return text.length > 0 ? text : undefined
+  }
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value)
+  if (typeof value !== "object") return undefined
+  if (seen.has(value) || depth >= ERROR_MESSAGE_DEPTH_LIMIT) return undefined
+  seen.add(value)
+  if (value instanceof Error && value.message.trim().length > 0) return value.message.trim()
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = nestedErrorMessage(item, depth + 1, seen)
+      if (found) return found
+    }
+    return undefined
+  }
+  if (!isRecord(value)) return undefined
+  for (const key of ERROR_MESSAGE_KEYS) {
+    const found = nestedErrorMessage(value[key], depth + 1, seen)
+    if (found) return found
+  }
+  return undefined
+}
+
+function serializeErrorSafely(value: unknown): string | undefined {
+  if (value === undefined) return undefined
+  try {
+    const json = JSON.stringify(value, (_key, nested: unknown) =>
+      nested instanceof Error ? { name: nested.name, message: nested.message } : nested,
+    )
+    if (!json || json === "null" || json === "{}" || json === '""') return undefined
+    return json.length > 240 ? `${json.slice(0, 239)}…` : json
+  } catch {
+    return undefined
+  }
+}
+
+/** Extracts a human-readable message from any thrown value; never `[object Object]`. */
 export function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+  const message = nestedErrorMessage(error, 0, new Set()) ?? serializeErrorSafely(error)
+  if (!message || message === "[object Object]") return "未知错误"
+  return message
 }
 
 /**
